@@ -13,6 +13,8 @@ const baseOptions = {
   includeXSearch: false,
   allowedXHandles: [],
   excludedXHandles: [],
+  xFromDate: null,
+  xToDate: null,
   openRouterEngine: "auto",
 };
 
@@ -39,6 +41,50 @@ assert.deepEqual(directBody.tools, [
   { type: "web_search", filters: { allowed_domains: ["docs.x.ai", "openai.com"] } },
   { type: "x_search", allowed_x_handles: ["xai", "OpenAI"] },
 ]);
+
+const fromDateBody = buildResponsesBody(
+  "latest posts",
+  { ...baseOptions, includeXSearch: true, xFromDate: "2026-07-01" },
+  { apiProvider: "xai" }
+);
+assert.deepEqual(fromDateBody.tools, [
+  { type: "web_search" },
+  { type: "x_search", from_date: "2026-07-01" },
+]);
+
+const toDateBody = buildResponsesBody(
+  "latest posts",
+  { ...baseOptions, includeXSearch: true, xToDate: "2026-07-31" },
+  { apiProvider: "xai" }
+);
+assert.deepEqual(toDateBody.tools, [
+  { type: "web_search" },
+  { type: "x_search", to_date: "2026-07-31" },
+]);
+
+const dateWindowBody = buildResponsesBody(
+  "latest posts",
+  {
+    ...baseOptions,
+    includeXSearch: true,
+    allowedXHandles: ["xai"],
+    xFromDate: "2026-07-01",
+    xToDate: "2026-07-31",
+    enableImageUnderstanding: true,
+    enableVideoUnderstanding: true,
+  },
+  { apiProvider: "openai-compatible" }
+);
+assert.deepEqual(dateWindowBody.tools, [
+  { type: "web_search" },
+  {
+    type: "x_search",
+    allowed_x_handles: ["xai"],
+    from_date: "2026-07-01",
+    to_date: "2026-07-31",
+  },
+]);
+assert.equal(JSON.stringify(dateWindowBody).includes("understanding"), false);
 
 const nonReasoningBody = buildResponsesBody(
   "latest docs",

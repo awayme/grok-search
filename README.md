@@ -79,6 +79,10 @@ chmod 600 ~/.config/grok-search/config.json
   "responsesIncludeXSearch": false,
   "responsesAllowedXHandles": [],
   "responsesExcludedXHandles": [],
+  "responsesXFromDate": "",
+  "responsesXToDate": "",
+  "responsesXEnableImageUnderstanding": false,
+  "responsesXEnableVideoUnderstanding": false,
   "responsesOpenRouterEngine": "auto",
   "defaultExtra": 6,
   "sourceChars": 400,
@@ -100,6 +104,9 @@ chmod 600 ~/.config/grok-search/config.json
 - `apiProvider` 省略时会按 URL 推断：包含 `openrouter` 视为 `openrouter`，包含 `api.x.ai` 视为 `xai`，其他 URL 视为 `openai-compatible`。中转服务建议显式填写，避免请求格式判断错误。
 - `model` 必须填写该 endpoint 实际支持的模型 ID；`responsesMaxTurns` 是不小于 1 的整数。`responsesReasoningEffort` 常见值为 `low`、`medium`、`high`，但是否支持取决于具体模型与 provider。
 - `responsesAllowedDomains`、`responsesExcludedDomains`、`responsesAllowedXHandles`、`responsesExcludedXHandles` 都是数组，可以填写多个值，例如 `["github.com", "docs.python.org"]`；同一组 allowed 与 excluded 不能同时使用。环境变量中的多值使用逗号分隔。
+- X handle 会移除一个前导 `@` 并按大小写不敏感去重；allowed 与 excluded 分别最多 20 个规范化后的值。
+- `responsesXFromDate`、`responsesXToDate` 使用严格 `YYYY-MM-DD`，边界 inclusive，并且只过滤 X posts，不过滤 Web Search、Tavily 或 Firecrawl 结果。配置任一日期会自动启用 `x_search`。
+- `responsesXEnableImageUnderstanding`、`responsesXEnableVideoUnderstanding` 当前必须保持 `false`；设为 `true` 会在任何搜索请求前返回 unsupported error。
 - `responsesOpenRouterEngine` 可选 `auto`、`native`、`exa`、`firecrawl`、`parallel` 或 `perplexity`，仅在 `apiProvider` 为 `openrouter` 时生效。
 - `tavilyApiKey` 可留空；`firecrawlApiKey` 也可留空并使用 Firecrawl Keyless。`outputDir` 留空时使用默认目录 `~/.cache/grok-search/outputs/`。
 
@@ -157,6 +164,10 @@ Node 原生 `fetch` 默认不会可靠读取终端代理变量。本项目会在
 | `GROK_RESPONSES_INCLUDE_X_SEARCH` | `responsesIncludeXSearch` | 否 | Responses | 是否启用 direct xAI `x_search`。默认 `false`。 |
 | `GROK_RESPONSES_ALLOWED_X_HANDLES` | `responsesAllowedXHandles` | 否 | Responses | X handle allow-list；与 excluded 互斥。 |
 | `GROK_RESPONSES_EXCLUDED_X_HANDLES` | `responsesExcludedXHandles` | 否 | Responses | X handle deny-list；与 allowed 互斥。 |
+| `GROK_RESPONSES_X_FROM_DATE` | `responsesXFromDate` | 否 | xAI / compatible Responses | X posts inclusive 起始日期，严格 `YYYY-MM-DD`。 |
+| `GROK_RESPONSES_X_TO_DATE` | `responsesXToDate` | 否 | xAI / compatible Responses | X posts inclusive 结束日期，严格 `YYYY-MM-DD`。 |
+| `GROK_RESPONSES_X_ENABLE_IMAGE_UNDERSTANDING` | `responsesXEnableImageUnderstanding` | 否 | Responses | 当前不支持；设为 `true` 会 fail fast。 |
+| `GROK_RESPONSES_X_ENABLE_VIDEO_UNDERSTANDING` | `responsesXEnableVideoUnderstanding` | 否 | Responses | 当前不支持；设为 `true` 会 fail fast。 |
 | `GROK_RESPONSES_OPENROUTER_ENGINE` | `responsesOpenRouterEngine` | 否 | OpenRouter Responses | `auto`、`native`、`exa`、`firecrawl`、`parallel` 或 `perplexity`。默认 `auto`。 |
 | `GROK_DEFAULT_EXTRA` | `defaultExtra` | 否 | `search.js` | Tavily 与 Firecrawl 合计的默认 extra source 数量。默认 `6`。 |
 | `GROK_SOURCE_CHARS` | `sourceChars` | 否 | `search.js` | 每条 source stdout snippet 长度。默认 `400`；`0` 表示不输出 snippet。 |
@@ -168,7 +179,18 @@ Node 原生 `fetch` 默认不会可靠读取终端代理变量。本项目会在
 | `GROK_DEBUG` | — | 否 | 所有脚本 | 仅环境变量。设为 `true` 时把重试 / 清理 / 代理调试日志写到 stderr。 |
 | `GROK_PROXY` | — | 否 | 所有脚本 | 仅环境变量。显式代理 URL，或设为 `off` / `direct` 禁用代理。 |
 
-OpenRouter 使用 `openrouter:web_search` server tool，不会给模型名追加 `:online`。
+日期过滤示例：
+
+```bash
+./scripts/search.js \
+  --responses-x-search \
+  --responses-x-from-date 2026-07-01 \
+  --responses-x-to-date 2026-07-31 \
+  --responses-allowed-x-handles xai,OpenAI \
+  "official announcements about new reasoning models"
+```
+
+OpenRouter 使用 `openrouter:web_search` server tool，不会给模型名追加 `:online`。本项目当前不支持 OpenRouter X Search 日期过滤；配置日期会返回 `RESPONSES_X_DATE_PROVIDER_UNSUPPORTED`。
 
 ## 输出 schema
 

@@ -46,7 +46,12 @@ X 搜索：
 ```bash
 ./scripts/search.js --responses-x-search "query"
 ./scripts/search.js --responses-x-search --responses-allowed-x-handles xai,OpenAI "query"
+./scripts/search.js --responses-x-from-date 2026-07-01 --responses-x-to-date 2026-07-31 "query"
 ```
+
+日期使用严格 `YYYY-MM-DD`，起止边界 inclusive，只过滤 X posts，不影响并行的 Web Search、Tavily 或 Firecrawl。只配置 `from_date` 或 `to_date` 也会自动启用 `x_search`。direct xAI 明确支持日期字段；`openai-compatible` relay 是否支持取决于其 Responses tool 实现。
+
+X handle filters 会移除一个前导 `@`、按大小写不敏感去重，并在规范化后限制 allowed/excluded 各最多 20 个。图片、视频理解参数当前仅被识别并 fail fast，不会进入请求 payload。
 
 固定推理模型或名称包含 `non-reasoning` 的模型不会发送可配置 reasoning 字段。
 
@@ -80,6 +85,8 @@ auto | native | exa | firecrawl | parallel | perplexity
 ```
 
 模型名不会自动追加 `:online`。
+
+本项目当前不支持 OpenRouter X Search 日期过滤。为 OpenRouter 配置日期会在网络请求前返回 `RESPONSES_X_DATE_PROVIDER_UNSUPPORTED`，不会静默丢弃字段。
 
 ## Responses sources
 
@@ -132,6 +139,7 @@ Firecrawl Search（Keyless/key）┘
 - `responses_max_turns`
 - `responses_web_search_calls`
 - `responses_x_search_calls`
+- `responses_x_from_date` / `responses_x_to_date`
 - `responses_tool_calls`
 - `extra_allocation`
 - `firecrawl_auth_mode`

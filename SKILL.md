@@ -27,6 +27,7 @@ Do not chain map → fetch → search by default. Run the fewest commands that a
 ./scripts/search.js --source-chars 200 "query"
 ./scripts/search.js --responses-openrouter-engine exa "strict web-only query"
 ./scripts/search.js --responses-x-search --responses-allowed-x-handles xai,OpenAI "query"
+./scripts/search.js --responses-x-from-date 2026-07-01 --responses-x-to-date 2026-07-31 "query"
 ```
 
 ```bash
@@ -43,6 +44,8 @@ Use `./scripts/fetch.js --max-chars 50000 URL` only for an explicit deep read af
 ```
 
 Search is Responses-only. It runs Grok Responses alongside independent Tavily and Firecrawl searches. Tavily is used when its key is configured; Firecrawl works keyless and automatically uses `FIRECRAWL_API_KEY` when available. The default combined extra target is 6. Add `--extra 10` only for a broader candidate-source sweep. Extras are never fed into Grok.
+
+X Search date filters use strict `YYYY-MM-DD` inclusive boundaries and apply only to X posts. A date filter implicitly enables `x_search`. Direct xAI supports them; Responses-compatible relays are provider-dependent, and OpenRouter is rejected locally. Image and video understanding options are recognized but unsupported and fail before any search request.
 
 If Grok quota is explicitly exhausted, `search.js` may return a visibly marked degraded answer made from raw Tavily/Firecrawl results. Check `diagnostics.degraded` and `diagnostics.grok_error`. Other Grok failures remain errors. `--no-extra` disables this fallback as well as the external searches.
 

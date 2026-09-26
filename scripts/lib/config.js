@@ -221,6 +221,36 @@ export async function loadConfig({ requireGrok = false } = {}) {
       "responsesExcludedXHandles",
       "responses_excluded_x_handles",
     ]),
+    responsesXFromDate: envOrFile("GROK_RESPONSES_X_FROM_DATE", fileConfig, [
+      "GROK_RESPONSES_X_FROM_DATE",
+      "responsesXFromDate",
+      "responses_x_from_date",
+    ]),
+    responsesXToDate: envOrFile("GROK_RESPONSES_X_TO_DATE", fileConfig, [
+      "GROK_RESPONSES_X_TO_DATE",
+      "responsesXToDate",
+      "responses_x_to_date",
+    ]),
+    responsesXEnableImageUnderstanding: envOrFileBool(
+      "GROK_RESPONSES_X_ENABLE_IMAGE_UNDERSTANDING",
+      fileConfig,
+      [
+        "GROK_RESPONSES_X_ENABLE_IMAGE_UNDERSTANDING",
+        "responsesXEnableImageUnderstanding",
+        "responses_x_enable_image_understanding",
+      ],
+      false
+    ),
+    responsesXEnableVideoUnderstanding: envOrFileBool(
+      "GROK_RESPONSES_X_ENABLE_VIDEO_UNDERSTANDING",
+      fileConfig,
+      [
+        "GROK_RESPONSES_X_ENABLE_VIDEO_UNDERSTANDING",
+        "responsesXEnableVideoUnderstanding",
+        "responses_x_enable_video_understanding",
+      ],
+      false
+    ),
     responsesOpenRouterEngine: envOrFile(
       "GROK_RESPONSES_OPENROUTER_ENGINE",
       fileConfig,

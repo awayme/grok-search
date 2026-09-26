@@ -19,6 +19,20 @@ function usage() {
 
 Run a Responses-compatible Grok/OpenRouter web search and return JSON with independent Tavily/Firecrawl sources.
 
+Responses options:
+  --responses-max-turns N
+  --responses-reasoning-effort LEVEL
+  --responses-allowed-domains LIST
+  --responses-excluded-domains LIST
+  --responses-x-search
+  --responses-allowed-x-handles LIST
+  --responses-excluded-x-handles LIST
+  --responses-x-from-date YYYY-MM-DD
+  --responses-x-to-date YYYY-MM-DD
+  --responses-x-enable-image-understanding  Recognized but not supported
+  --responses-x-enable-video-understanding  Recognized but not supported
+  --responses-openrouter-engine ENGINE
+
 Environment:
   GROK_API_URL         Responses-compatible base URL; required
   GROK_API_KEY         API key for GROK_API_URL; required
@@ -26,6 +40,21 @@ Environment:
   GROK_MODEL           Optional default model; default grok-4.3
   GROK_RESPONSES_MAX_TURNS
                        Optional Responses max_turns; default 3
+  GROK_RESPONSES_REASONING_EFFORT
+                       Optional Responses reasoning effort; default low
+  GROK_RESPONSES_ALLOWED_DOMAINS / GROK_RESPONSES_EXCLUDED_DOMAINS
+                       Optional comma-separated Web Search domain filters
+  GROK_RESPONSES_INCLUDE_X_SEARCH
+                       Optional X Search switch; default false
+  GROK_RESPONSES_ALLOWED_X_HANDLES / GROK_RESPONSES_EXCLUDED_X_HANDLES
+                       Optional comma-separated X handle filters; max 20
+  GROK_RESPONSES_X_FROM_DATE / GROK_RESPONSES_X_TO_DATE
+                       Optional inclusive X post date window in YYYY-MM-DD
+  GROK_RESPONSES_X_ENABLE_IMAGE_UNDERSTANDING
+  GROK_RESPONSES_X_ENABLE_VIDEO_UNDERSTANDING
+                       Recognized but not supported; true fails before search
+  GROK_RESPONSES_OPENROUTER_ENGINE
+                       Optional OpenRouter search engine; default auto
   GROK_DEFAULT_EXTRA   Optional total Tavily/Firecrawl source count; default 6
   GROK_SOURCE_CHARS    Optional source snippet size; default 400
   TAVILY_API_KEY       Optional Tavily parallel source provider
@@ -53,6 +82,12 @@ function parseListArg(name, value) {
   return parseListOption(value);
 }
 
+function parseStringArg(name, value) {
+  const normalized = String(value || "").trim();
+  if (!normalized) throw new Error(`${name} requires a value`);
+  return normalized;
+}
+
 function parseArgs(argv) {
   const args = [...argv];
   const queryParts = [];
@@ -72,6 +107,10 @@ function parseArgs(argv) {
   let responsesIncludeXSearch = null;
   let responsesAllowedXHandles = null;
   let responsesExcludedXHandles = null;
+  let responsesXFromDate = null;
+  let responsesXToDate = null;
+  let responsesXEnableImageUnderstanding = null;
+  let responsesXEnableVideoUnderstanding = null;
   let responsesOpenRouterEngine = "";
 
   while (args.length) {
@@ -148,6 +187,30 @@ function parseArgs(argv) {
       responsesExcludedXHandles = parseListOption(arg.slice("--responses-excluded-x-handles=".length));
       continue;
     }
+    if (arg === "--responses-x-from-date") {
+      responsesXFromDate = parseStringArg("--responses-x-from-date", args.shift());
+      continue;
+    }
+    if (arg?.startsWith("--responses-x-from-date=")) {
+      responsesXFromDate = parseStringArg("--responses-x-from-date", arg.slice("--responses-x-from-date=".length));
+      continue;
+    }
+    if (arg === "--responses-x-to-date") {
+      responsesXToDate = parseStringArg("--responses-x-to-date", args.shift());
+      continue;
+    }
+    if (arg?.startsWith("--responses-x-to-date=")) {
+      responsesXToDate = parseStringArg("--responses-x-to-date", arg.slice("--responses-x-to-date=".length));
+      continue;
+    }
+    if (arg === "--responses-x-enable-image-understanding") {
+      responsesXEnableImageUnderstanding = true;
+      continue;
+    }
+    if (arg === "--responses-x-enable-video-understanding") {
+      responsesXEnableVideoUnderstanding = true;
+      continue;
+    }
     if (arg === "--responses-openrouter-engine") {
       responsesOpenRouterEngine = args.shift() || "";
       if (!responsesOpenRouterEngine) throw new Error("--responses-openrouter-engine 缺少值");
@@ -221,6 +284,10 @@ function parseArgs(argv) {
     responsesIncludeXSearch,
     responsesAllowedXHandles,
     responsesExcludedXHandles,
+    responsesXFromDate,
+    responsesXToDate,
+    responsesXEnableImageUnderstanding,
+    responsesXEnableVideoUnderstanding,
     responsesOpenRouterEngine,
   };
 }
@@ -298,6 +365,70 @@ function validateMaxItems(list, name, max) {
   if (list.length > max) throw new ConfigError(`${name} 最多支持 ${max} 个值`, "RESPONSES_FILTER_LIMIT");
 }
 
+function normalizeIsoDate(name, value) {
+  if (value == null) return null;
+  const normalized = String(value).trim();
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(normalized);
+  if (match) {
+    const year = Number(match[1]);
+    const month = Number(match[2]);
+    const day = Number(match[3]);
+    const calendarDate = new Date(0);
+    calendarDate.setUTCHours(0, 0, 0, 0);
+    calendarDate.setUTCFullYear(year, month - 1, day);
+    if (
+      calendarDate.getUTCFullYear() === year &&
+      calendarDate.getUTCMonth() === month - 1 &&
+      calendarDate.getUTCDate() === day
+    ) {
+      return normalized;
+    }
+  }
+  throw new ConfigError(
+    `${name} must be a valid calendar date in YYYY-MM-DD format; received "${normalized}".`,
+    "RESPONSES_X_DATE_INVALID"
+  );
+}
+
+function normalizeXHandles(values, name) {
+  const normalized = [];
+  const seen = new Set();
+  for (const value of values || []) {
+    const raw = String(value || "").trim();
+    const handle = raw.startsWith("@") ? raw.slice(1) : raw;
+    if (!handle || /[\s@/]/.test(handle)) {
+      throw new ConfigError(
+        `${name} contains an invalid X handle "${raw}"; use a handle name without whitespace, a URL, or multiple @ prefixes.`,
+        "RESPONSES_X_HANDLE_INVALID"
+      );
+    }
+    const key = handle.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    normalized.push(handle);
+  }
+  return normalized;
+}
+
+function validateUnsupportedXMedia(enableImage, enableVideo) {
+  const parameters = [];
+  const options = [];
+  if (enableImage) {
+    parameters.push("enable_image_understanding");
+    options.push("--responses-x-enable-image-understanding");
+  }
+  if (enableVideo) {
+    parameters.push("enable_video_understanding");
+    options.push("--responses-x-enable-video-understanding");
+  }
+  if (!parameters.length) return;
+  const plural = parameters.length > 1;
+  throw new ConfigError(
+    `X Search parameter${plural ? "s" : ""} ${parameters.join(" and ")} ${plural ? "are" : "is"} not supported by this project yet. Remove ${options.join(" and ")} and use text-only X Search.`,
+    "RESPONSES_X_MEDIA_UNSUPPORTED"
+  );
+}
+
 function resolveSearchOptions(args, config) {
   const domainFilters = exclusiveOptionPair(
     args.responsesAllowedDomains,
@@ -313,13 +444,36 @@ function resolveSearchOptions(args, config) {
   );
   const allowedDomains = domainFilters.left;
   const excludedDomains = domainFilters.right;
-  const allowedXHandles = xHandleFilters.left;
-  const excludedXHandles = xHandleFilters.right;
+  const enableImageUnderstanding =
+    args.responsesXEnableImageUnderstanding ?? config.responsesXEnableImageUnderstanding;
+  const enableVideoUnderstanding =
+    args.responsesXEnableVideoUnderstanding ?? config.responsesXEnableVideoUnderstanding;
+  validateUnsupportedXMedia(enableImageUnderstanding, enableVideoUnderstanding);
+
+  const xFromDate = normalizeIsoDate("GROK_RESPONSES_X_FROM_DATE", args.responsesXFromDate ?? config.responsesXFromDate);
+  const xToDate = normalizeIsoDate("GROK_RESPONSES_X_TO_DATE", args.responsesXToDate ?? config.responsesXToDate);
+  if (xFromDate && xToDate && xFromDate > xToDate) {
+    throw new ConfigError(
+      `X Search from_date must not be later than to_date; received ${xFromDate} > ${xToDate}.`,
+      "RESPONSES_X_DATE_RANGE_INVALID"
+    );
+  }
+  if ((xFromDate || xToDate) && config.apiProvider === "openrouter") {
+    throw new ConfigError(
+      "X Search date filters are not supported for apiProvider=openrouter by this project. Use direct xAI Responses or remove the date filters.",
+      "RESPONSES_X_DATE_PROVIDER_UNSUPPORTED"
+    );
+  }
+
+  const allowedXHandles = normalizeXHandles(xHandleFilters.left, "responses allowed X handles");
+  const excludedXHandles = normalizeXHandles(xHandleFilters.right, "responses excluded X handles");
 
   validateExclusiveLists(allowedDomains, excludedDomains, "responses allowed domains", "responses excluded domains");
   validateExclusiveLists(allowedXHandles, excludedXHandles, "responses allowed X handles", "responses excluded X handles");
   validateMaxItems(allowedDomains, "responses allowed domains", 5);
   validateMaxItems(excludedDomains, "responses excluded domains", 5);
+  validateMaxItems(allowedXHandles, "responses allowed X handles", 20);
+  validateMaxItems(excludedXHandles, "responses excluded X handles", 20);
 
   return {
     model: args.model || config.grokModel,
@@ -328,9 +482,12 @@ function resolveSearchOptions(args, config) {
     allowedDomains,
     excludedDomains,
     includeXSearch:
-      (args.responsesIncludeXSearch ?? config.responsesIncludeXSearch) || Boolean(allowedXHandles.length || excludedXHandles.length),
+      (args.responsesIncludeXSearch ?? config.responsesIncludeXSearch) ||
+      Boolean(allowedXHandles.length || excludedXHandles.length || xFromDate || xToDate),
     allowedXHandles,
     excludedXHandles,
+    xFromDate,
+    xToDate,
     openRouterEngine: normalizeOpenRouterSearchEngine(args.responsesOpenRouterEngine || config.responsesOpenRouterEngine),
   };
 }
@@ -344,6 +501,8 @@ function responsesDiagnosticOptions(searchOptions) {
     responses_include_x_search: searchOptions.includeXSearch,
     responses_allowed_x_handles: searchOptions.allowedXHandles,
     responses_excluded_x_handles: searchOptions.excludedXHandles,
+    responses_x_from_date: searchOptions.xFromDate,
+    responses_x_to_date: searchOptions.xToDate,
     responses_openrouter_engine: searchOptions.openRouterEngine,
   };
 }
@@ -368,6 +527,8 @@ async function grokChannel(args, config, searchOptions) {
       includeXSearch: searchOptions.includeXSearch,
       allowedXHandles: searchOptions.allowedXHandles,
       excludedXHandles: searchOptions.excludedXHandles,
+      xFromDate: searchOptions.xFromDate,
+      xToDate: searchOptions.xToDate,
       openRouterEngine: searchOptions.openRouterEngine,
     },
     config

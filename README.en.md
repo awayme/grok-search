@@ -79,6 +79,10 @@ Full configuration example:
   "responsesIncludeXSearch": false,
   "responsesAllowedXHandles": [],
   "responsesExcludedXHandles": [],
+  "responsesXFromDate": "",
+  "responsesXToDate": "",
+  "responsesXEnableImageUnderstanding": false,
+  "responsesXEnableVideoUnderstanding": false,
   "responsesOpenRouterEngine": "auto",
   "defaultExtra": 6,
   "sourceChars": 400,
@@ -100,6 +104,9 @@ Common configuration rules:
 - When `apiProvider` is omitted, it is inferred from the URL: URLs containing `openrouter` use `openrouter`, URLs containing `api.x.ai` use `xai`, and all others use `openai-compatible`. Set it explicitly for relay services to avoid selecting the wrong request format.
 - `model` must be an ID supported by that endpoint. `responsesMaxTurns` is an integer of at least 1. Common `responsesReasoningEffort` values are `low`, `medium`, and `high`, but support depends on the selected model and provider.
 - `responsesAllowedDomains`, `responsesExcludedDomains`, `responsesAllowedXHandles`, and `responsesExcludedXHandles` are arrays and may contain multiple values, for example `["github.com", "docs.python.org"]`. The allowed and excluded forms of the same filter are mutually exclusive. In environment variables, separate multiple values with commas.
+- X handles have one leading `@` removed and are deduplicated case-insensitively. The allowed and excluded lists each accept at most 20 normalized handles.
+- `responsesXFromDate` and `responsesXToDate` use strict `YYYY-MM-DD` dates with inclusive boundaries. They filter X posts only, not Web Search, Tavily, or Firecrawl results. Either date implicitly enables `x_search`.
+- `responsesXEnableImageUnderstanding` and `responsesXEnableVideoUnderstanding` must remain `false`; setting either to `true` returns an unsupported error before any search request.
 - `responsesOpenRouterEngine` accepts `auto`, `native`, `exa`, `firecrawl`, `parallel`, or `perplexity`, and only applies when `apiProvider` is `openrouter`.
 - `tavilyApiKey` is optional. `firecrawlApiKey` may also be empty to use Firecrawl Keyless. An empty `outputDir` uses `~/.cache/grok-search/outputs/`.
 
@@ -164,6 +171,10 @@ Supported variables:
 | `GROK_RESPONSES_INCLUDE_X_SEARCH` | `responsesIncludeXSearch` | No | Responses | Enables direct xAI `x_search`. Default: `false`. |
 | `GROK_RESPONSES_ALLOWED_X_HANDLES` | `responsesAllowedXHandles` | No | Responses | X handle allow-list; mutually exclusive with excluded handles. |
 | `GROK_RESPONSES_EXCLUDED_X_HANDLES` | `responsesExcludedXHandles` | No | Responses | X handle deny-list; mutually exclusive with allowed handles. |
+| `GROK_RESPONSES_X_FROM_DATE` | `responsesXFromDate` | No | xAI / compatible Responses | Inclusive X post start date in strict `YYYY-MM-DD` format. |
+| `GROK_RESPONSES_X_TO_DATE` | `responsesXToDate` | No | xAI / compatible Responses | Inclusive X post end date in strict `YYYY-MM-DD` format. |
+| `GROK_RESPONSES_X_ENABLE_IMAGE_UNDERSTANDING` | `responsesXEnableImageUnderstanding` | No | Responses | Not supported; `true` fails fast. |
+| `GROK_RESPONSES_X_ENABLE_VIDEO_UNDERSTANDING` | `responsesXEnableVideoUnderstanding` | No | Responses | Not supported; `true` fails fast. |
 | `GROK_RESPONSES_OPENROUTER_ENGINE` | `responsesOpenRouterEngine` | No | OpenRouter Responses | `auto`, `native`, `exa`, `firecrawl`, `parallel`, or `perplexity`. Default: `auto`. |
 | `GROK_DEFAULT_EXTRA` | `defaultExtra` | No | `search.js` | Combined Tavily/Firecrawl source target. Default: `6`. |
 | `GROK_SOURCE_CHARS` | `sourceChars` | No | `search.js` | Per-source stdout snippet limit. Default: `400`; `0` omits snippets. |
@@ -175,7 +186,18 @@ Supported variables:
 | `GROK_DEBUG` | — | No | all scripts | Env only. `true` prints retry/cleanup/proxy debug logs to stderr. |
 | `GROK_PROXY` | — | No | all scripts | Env only. Explicit proxy URL for this tool, or `off`/`direct` to disable proxy use. |
 
-OpenRouter uses the `openrouter:web_search` server tool and does not append `:online` to model names.
+X Search date filter example:
+
+```bash
+./scripts/search.js \
+  --responses-x-search \
+  --responses-x-from-date 2026-07-01 \
+  --responses-x-to-date 2026-07-31 \
+  --responses-allowed-x-handles xai,OpenAI \
+  "official announcements about new reasoning models"
+```
+
+OpenRouter uses the `openrouter:web_search` server tool and does not append `:online` to model names. This project does not currently support OpenRouter X Search date filters; configuring a date returns `RESPONSES_X_DATE_PROVIDER_UNSUPPORTED`.
 
 ## Output Schema
 

@@ -41,6 +41,8 @@ function directXSearchTool(options) {
   const tool = { type: "x_search" };
   if (options.allowedXHandles.length) tool.allowed_x_handles = options.allowedXHandles;
   if (options.excludedXHandles.length) tool.excluded_x_handles = options.excludedXHandles;
+  if (options.xFromDate) tool.from_date = options.xFromDate;
+  if (options.xToDate) tool.to_date = options.xToDate;
   return tool;
 }
 
