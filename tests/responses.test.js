@@ -10,11 +10,13 @@ const baseOptions = {
   reasoningEffort: "low",
   allowedDomains: [],
   excludedDomains: [],
-  includeXSearch: false,
+  searchSource: "web",
   allowedXHandles: [],
   excludedXHandles: [],
-  xFromDate: null,
-  xToDate: null,
+  xFromDate: "",
+  xToDate: "",
+  xImageUnderstanding: false,
+  xVideoUnderstanding: false,
   openRouterEngine: "auto",
 };
 
@@ -28,7 +30,7 @@ const directBody = buildResponsesBody(
     maxTurns: 2,
     reasoningEffort: "medium",
     allowedDomains: ["docs.x.ai", "openai.com"],
-    includeXSearch: true,
+    searchSource: "both",
     allowedXHandles: ["xai", "OpenAI"],
   },
   { apiProvider: "xai" }
@@ -41,10 +43,60 @@ assert.deepEqual(directBody.tools, [
   { type: "web_search", filters: { allowed_domains: ["docs.x.ai", "openai.com"] } },
   { type: "x_search", allowed_x_handles: ["xai", "OpenAI"] },
 ]);
+// The base prompt stays the first system message so it remains a cache prefix.
+assert.equal(directBody.input.length, 3);
+assert.equal(directBody.input[0].role, "system");
+assert.equal(directBody.input[1].role, "system");
+assert.match(directBody.input[1].content, /X \(Twitter\) evidence/);
+assert.equal(directBody.input[2].role, "user");
+
+// Caller instructions go after the query in the user message; system messages are untouched.
+const instructedBody = buildResponsesBody(
+  "latest docs",
+  { ...baseOptions, instructions: "Return only official changelog links. Answer in Chinese." },
+  { apiProvider: "xai" }
+);
+assert.equal(instructedBody.input.length, 2);
+assert.equal(instructedBody.input[0].content, directBody.input[0].content);
+assert.match(instructedBody.input[1].content, /\n# Search query\nlatest docs\n\n# Instructions from the caller\nReturn only official changelog links\. Answer in Chinese\.\n$/);
+// Without instructions the query stays bare, exactly as before.
+assert.equal(/# Search query/.test(directBody.input[2].content), false);
+assert.equal(directBody.input[2].content.endsWith("latest docs"), true);
+const plainBody = buildResponsesBody("latest docs", { ...baseOptions, instructions: "   " }, { apiProvider: "xai" });
+assert.equal(/Instructions from the caller/.test(plainBody.input[1].content), false);
+
+const webOnlyBody = buildResponsesBody("latest docs", baseOptions, { apiProvider: "xai" });
+assert.deepEqual(webOnlyBody.tools, [{ type: "web_search" }]);
+assert.equal(webOnlyBody.input.length, 2);
+assert.equal(webOnlyBody.input.every((message) => !/X \(Twitter\) evidence/.test(message.content)), true);
+
+const xOnlyBody = buildResponsesBody(
+  "what is X saying",
+  {
+    ...baseOptions,
+    searchSource: "x",
+    excludedXHandles: ["spam_account"],
+    xFromDate: "2026-08-01",
+    xToDate: "2026-08-16",
+    xImageUnderstanding: true,
+    xVideoUnderstanding: true,
+  },
+  { apiProvider: "xai" }
+);
+assert.deepEqual(xOnlyBody.tools, [
+  {
+    type: "x_search",
+    excluded_x_handles: ["spam_account"],
+    from_date: "2026-08-01",
+    to_date: "2026-08-16",
+    enable_image_understanding: true,
+    enable_video_understanding: true,
+  },
+]);
 
 const fromDateBody = buildResponsesBody(
   "latest posts",
-  { ...baseOptions, includeXSearch: true, xFromDate: "2026-07-01" },
+  { ...baseOptions, searchSource: "both", xFromDate: "2026-07-01" },
   { apiProvider: "xai" }
 );
 assert.deepEqual(fromDateBody.tools, [
@@ -54,7 +106,7 @@ assert.deepEqual(fromDateBody.tools, [
 
 const toDateBody = buildResponsesBody(
   "latest posts",
-  { ...baseOptions, includeXSearch: true, xToDate: "2026-07-31" },
+  { ...baseOptions, searchSource: "both", xToDate: "2026-07-31" },
   { apiProvider: "xai" }
 );
 assert.deepEqual(toDateBody.tools, [
@@ -66,12 +118,10 @@ const dateWindowBody = buildResponsesBody(
   "latest posts",
   {
     ...baseOptions,
-    includeXSearch: true,
+    searchSource: "both",
     allowedXHandles: ["xai"],
     xFromDate: "2026-07-01",
     xToDate: "2026-07-31",
-    enableImageUnderstanding: true,
-    enableVideoUnderstanding: true,
   },
   { apiProvider: "openai-compatible" }
 );
@@ -113,8 +163,9 @@ const openRouterBody = buildResponsesBody(
     ...baseOptions,
     model: "x-ai/grok-4.1-fast",
     excludedDomains: ["reddit.com"],
-    includeXSearch: true,
+    searchSource: "both",
     excludedXHandles: ["noisy_account"],
+    xFromDate: "2026-01-01",
     openRouterEngine: "exa",
   },
   { apiProvider: "openrouter" }
@@ -133,7 +184,10 @@ assert.deepEqual(openRouterBody.tools, [
     },
   },
 ]);
-assert.deepEqual(openRouterBody.x_search_filter, { excluded_x_handles: ["noisy_account"] });
+assert.deepEqual(openRouterBody.x_search_filter, {
+  excluded_x_handles: ["noisy_account"],
+  from_date: "2026-01-01",
+});
 
 const parsed = parseGrokResponses({
   output: [
@@ -221,7 +275,7 @@ assert.deepEqual(
 );
 assert.equal(openRouterParsed.diagnostics.cost_usd, 0.25);
 
-const xParsed = parseGrokResponses({
+const xPayload = {
   output: [
     {
       type: "x_search_call",
@@ -248,12 +302,28 @@ const xParsed = parseGrokResponses({
       ],
     },
   ],
-});
+};
 
-assert.equal(xParsed.sources.length, 1);
+const xParsed = parseGrokResponses(xPayload, { xEnabled: true });
+
+// The X citation plus the page Grok opened (open_page URLs are evidence even when no
+// search listing carried them).
+assert.equal(xParsed.sources.length, 2);
 assert.equal(xParsed.sources[0].tool, "x_search");
+// The citation title is only the inline marker; the handle comes from the URL instead.
+assert.equal(xParsed.sources[0].title, "@xai");
+assert.equal(xParsed.sources[0].x_handle, "xai");
+assert.equal(xParsed.sources[0].x_post_id, "123");
+assert.deepEqual(xParsed.sources[1], {
+  provider: "grok-responses",
+  source_type: "searched",
+  tool: "web_search",
+  url: "https://docs.x.ai/developers/grok-4-5",
+  opened: true,
+});
 assert.equal(xParsed.diagnostics.responses_web_search_calls, 1);
 assert.equal(xParsed.diagnostics.responses_x_search_calls, 1);
+assert.equal(xParsed.diagnostics.responses_tool_call_total, 2);
 assert.deepEqual(xParsed.diagnostics.responses_tool_calls, [
   {
     tool: "x_search",
@@ -272,6 +342,222 @@ assert.deepEqual(xParsed.diagnostics.responses_tool_calls, [
     source_count: 0,
   },
 ]);
+
+// Under --source web no x_search tool is mounted, so an x.com citation web search found
+// must not be relabeled as an X search that never ran.
+const webOnlyXCitation = parseGrokResponses(xPayload, { xEnabled: false });
+assert.equal(webOnlyXCitation.sources[0].tool, "web_search");
+// The URL-derived attribution is still useful and stays regardless of the mounted tool.
+assert.equal(webOnlyXCitation.sources[0].x_handle, "xai");
+
+// Relays that bill x_search without emitting x_search_call items in output[]: usage wins.
+const usageCountedParsed = parseGrokResponses({
+  output: [
+    {
+      type: "message",
+      content: [
+        {
+          type: "output_text",
+          text: "Answer from X.",
+          annotations: [
+            { type: "url_citation", url: "https://x.com/kunchenguid/status/2087942296721559607", title: "1" },
+            { type: "url_citation", url: "https://x.com/i/status/2087942296721559608", title: "2" },
+          ],
+        },
+      ],
+    },
+  ],
+  usage: {
+    input_tokens: 100,
+    output_tokens: 20,
+    server_side_tool_usage_details: { web_search_calls: 0, x_search_calls: 8 },
+  },
+}, { xEnabled: true });
+
+assert.equal(usageCountedParsed.diagnostics.responses_x_search_calls, 8);
+assert.equal(usageCountedParsed.diagnostics.responses_web_search_calls, 0);
+assert.equal(usageCountedParsed.diagnostics.responses_tool_call_total, 8);
+assert.equal(usageCountedParsed.diagnostics.responses_tool_calls.length, 0);
+assert.deepEqual(usageCountedParsed.diagnostics.responses_tool_call_counts, {
+  upstream: { web: 0, x: 8 },
+  trace: { web: 0, x: 0 },
+});
+assert.equal(usageCountedParsed.sources[0].title, "@kunchenguid");
+assert.equal(usageCountedParsed.sources[0].x_handle, "kunchenguid");
+// x.com/i/status/... carries no handle, so the marker title is dropped rather than kept.
+assert.equal(usageCountedParsed.sources[1].x_post_id, "2087942296721559608");
+assert.equal(Object.hasOwn(usageCountedParsed.sources[1], "x_handle"), false);
+assert.equal(Object.hasOwn(usageCountedParsed.sources[1], "title"), false);
+
+// The mirror relay bug: usage reports the field zeroed out while output[] shows the calls.
+// Neither source alone is trustworthy, so the higher per-tool count wins.
+const zeroedUsageParsed = parseGrokResponses({
+  output: [
+    { type: "web_search_call", status: "completed", action: { type: "search", query: "a" } },
+    { type: "web_search_call", status: "completed", action: { type: "search", query: "b" } },
+    { type: "message", content: [{ type: "output_text", text: "Answer." }] },
+  ],
+  usage: { server_side_tool_usage_details: { web_search_calls: 0, x_search_calls: 0 } },
+});
+assert.equal(zeroedUsageParsed.diagnostics.responses_web_search_calls, 2);
+assert.equal(zeroedUsageParsed.diagnostics.responses_tool_call_total, 2);
+assert.deepEqual(zeroedUsageParsed.diagnostics.responses_tool_call_counts, {
+  upstream: { web: 0, x: 0 },
+  trace: { web: 2, x: 0 },
+});
+
+// No usage block at all: upstream is null rather than a fake zero.
+const noUsageParsed = parseGrokResponses({
+  output: [
+    { type: "web_search_call", status: "completed", action: { type: "search", query: "a" } },
+    { type: "message", content: [{ type: "output_text", text: "Answer." }] },
+  ],
+});
+assert.deepEqual(noUsageParsed.diagnostics.responses_tool_call_counts, { upstream: null, trace: { web: 1, x: 0 } });
+
+// A marker title ("1") on the citation is a placeholder: the real title from the search
+// listing replaces it, and a page Grok opened is marked as such on the existing card.
+const markerParsed = parseGrokResponses({
+  output: [
+    {
+      type: "web_search_call",
+      status: "completed",
+      action: {
+        type: "search",
+        query: "pi context window",
+        sources: [
+          { url: "https://github.com/o/r/issues/1", title: "Real issue title", snippet: "real snippet" },
+          { url: "https://github.com/o/r/issues/2", title: "Second issue" },
+        ],
+      },
+    },
+    { type: "web_search_call", status: "completed", action: { type: "open_page", url: "https://github.com/o/r/issues/2" } },
+    {
+      type: "message",
+      content: [
+        {
+          type: "output_text",
+          text: "answer [1]",
+          annotations: [{ type: "url_citation", url: "https://github.com/o/r/issues/1", title: "1" }],
+        },
+      ],
+    },
+  ],
+});
+assert.equal(markerParsed.sources[0].source_type, "citation");
+assert.equal(markerParsed.sources[0].title, "Real issue title");
+assert.equal(markerParsed.sources[0].snippet, "real snippet");
+assert.equal(Object.hasOwn(markerParsed.sources[0], "opened"), false);
+assert.equal(markerParsed.sources[1].title, "Second issue");
+assert.equal(markerParsed.sources[1].opened, true);
+assert.equal(markerParsed.sources.length, 2);
+// Without a real title anywhere, the marker is dropped: a footnote number is not a title,
+// and the agent reads an absent field better than a misleading one. (Seen live on 2026-09-08:
+// a relay's web_search listed 20 GitHub URLs with no titles, so the citation showed as "1".)
+const markerOnly = parseGrokResponses({
+  output: [
+    {
+      type: "message",
+      content: [{ type: "output_text", text: "x", annotations: [{ type: "url_citation", url: "https://example.com/p", title: "3" }] }],
+    },
+  ],
+});
+assert.equal(Object.hasOwn(markerOnly.sources[0], "title"), false);
+assert.equal(markerOnly.sources[0].source_type, "citation");
+
+// A relay that passes xAI's x_search through as its underlying tools: custom_tool_call items
+// named x_keyword_search / x_thread_fetch with JSON-string arguments (seen 2026-09-08). They
+// count as x_search calls, by_action reads like the web side, and the query is recovered.
+const customXParsed = parseGrokResponses(
+  {
+    model: "grok-4.5",
+    output: [
+      { type: "reasoning" },
+      { type: "message", content: [{ type: "output_text", text: "I'll search X for firsthand posts about Grok 4.6 in coding agents." }] },
+      { type: "custom_tool_call", name: "x_keyword_search", status: "completed", input: JSON.stringify({ query: "Grok 4.6 cursor", limit: "10", mode: "Latest" }) },
+      { type: "custom_tool_call", name: "x_thread_fetch", status: "completed", input: JSON.stringify({ post_id: "2095712849473741107" }) },
+      { type: "custom_tool_call", name: "x_semantic_search", status: "completed", input: "not json" },
+      { type: "message", content: [{ type: "output_text", text: "Pulling a few more threads." }] },
+      {
+        type: "message",
+        content: [
+          {
+            type: "output_text",
+            text: "## Firsthand posts\n1. **@smalldozes** — 2026-09-04 — switched to cursor + grok 4.6.",
+            annotations: [{ type: "url_citation", url: "https://x.com/smalldozes/status/2095712849473741107", title: "1" }],
+          },
+        ],
+      },
+    ],
+    usage: { server_side_tool_usage_details: { web_search_calls: 0, x_search_calls: 3 } },
+  },
+  { defaultTool: "x_search", xEnabled: true, requestedModel: "grok-4.5" }
+);
+assert.equal(customXParsed.diagnostics.responses_x_search_calls, 3);
+assert.deepEqual(customXParsed.diagnostics.responses_tool_call_counts, { upstream: { web: 0, x: 3 }, trace: { web: 0, x: 3 } });
+assert.deepEqual(
+  customXParsed.diagnostics.responses_tool_calls.map((call) => [call.tool, call.action_type, call.query ?? null, call.post_id ?? null]),
+  [
+    ["x_search", "keyword_search", "Grok 4.6 cursor", null],
+    ["x_search", "thread_fetch", null, "2095712849473741107"],
+    ["x_search", "semantic_search", null, null],
+  ]
+);
+// Narration between tool calls is dropped; the final message is the answer.
+assert.equal(customXParsed.text.startsWith("## Firsthand posts"), true);
+assert.equal(/I'll search X|Pulling a few/.test(customXParsed.text), false);
+assert.equal(customXParsed.diagnostics.responses_model, "grok-4.5");
+assert.equal(customXParsed.diagnostics.warnings.some((w) => /served model/.test(w)), false);
+
+// A long earlier message or one carrying citations is not narration and stays.
+const twoPartParsed = parseGrokResponses({
+  output: [
+    { type: "message", content: [{ type: "output_text", text: "Part one. " + "x".repeat(300) }] },
+    { type: "message", content: [{ type: "output_text", text: "Part two." }] },
+  ],
+});
+assert.equal(twoPartParsed.text.startsWith("Part one."), true);
+assert.equal(twoPartParsed.text.endsWith("Part two."), true);
+const singleParsed = parseGrokResponses({ output: [{ type: "message", content: [{ type: "output_text", text: "Short only." }] }] });
+assert.equal(singleParsed.text, "Short only.");
+
+// The relay silently served another model: say so (micuapi returned grok-4.5-build for
+// every grok-4.5 request on 2026-09-08, at two to three times the tool calls).
+const substituted = parseGrokResponses(
+  { model: "grok-4.5-build", output: [{ type: "message", content: [{ type: "output_text", text: "Answer." }] }] },
+  { requestedModel: "grok-4.5" }
+);
+assert.equal(substituted.diagnostics.responses_model, "grok-4.5-build");
+assert.equal(substituted.diagnostics.warnings.some((w) => /served model "grok-4\.5-build" for requested "grok-4\.5"/.test(w)), true);
+
+// parallel_tool_calls is only sent when the caller decided.
+assert.equal(Object.hasOwn(buildResponsesBody("q", baseOptions, { apiProvider: "xai" }), "parallel_tool_calls"), false);
+assert.equal(buildResponsesBody("q", { ...baseOptions, parallelToolCalls: false }, { apiProvider: "xai" }).parallel_tool_calls, false);
+assert.equal(buildResponsesBody("q", { ...baseOptions, parallelToolCalls: true }, { apiProvider: "xai" }).parallel_tool_calls, true);
+assert.equal(buildResponsesBody("q", { ...baseOptions, parallelToolCalls: false }, { apiProvider: "openrouter" }).parallel_tool_calls, false);
+
+// A citation whose title is its own URL (seen on a relay 2026-09-08) gets no title, and an X
+// URL without a handle then carries only x_post_id.
+const urlTitled = parseGrokResponses({
+  output: [
+    {
+      type: "message",
+      content: [
+        {
+          type: "output_text",
+          text: "a [1] b [2]",
+          annotations: [
+            { type: "url_citation", url: "https://x.com/i/status/2097015220749074540", title: "https://x.com/i/status/2097015220749074540" },
+            { type: "url_citation", url: "https://example.com/post", title: "https://example.com/post" },
+          ],
+        },
+      ],
+    },
+  ],
+});
+assert.equal(Object.hasOwn(urlTitled.sources[0], "title"), false);
+assert.equal(urlTitled.sources[0].x_post_id, "2097015220749074540");
+assert.equal(Object.hasOwn(urlTitled.sources[1], "title"), false);
 
 const missing = parseGrokResponses({});
 assert.equal(missing.text, "");

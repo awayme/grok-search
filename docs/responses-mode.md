@@ -41,19 +41,48 @@
 }
 ```
 
-X 搜索：
+固定推理模型或名称包含 `non-reasoning` 的模型不会发送可配置 reasoning 字段。
+
+## 检索源（`--source`）
+
+`--source` 决定挂哪些 Grok 服务端工具，默认 `web`：
+
+| 模式 | tools | 用途 |
+| --- | --- | --- |
+| `web` | `web_search` | 默认；网页与官方文档 |
+| `x` | `x_search` | 只查 X 帖子、账号、thread |
+| `both` | `web_search` + `x_search` | 由 Grok 自行路由 |
 
 ```bash
-./scripts/search.js --responses-x-search "query"
-./scripts/search.js --responses-x-search --responses-allowed-x-handles xai,OpenAI "query"
-./scripts/search.js --responses-x-from-date 2026-07-01 --responses-x-to-date 2026-07-31 "query"
+./scripts/search.js --source x "X 上怎么评价 grok-4.6"
+./scripts/search.js --source both "grok-4.6 发布后的反响"
+./scripts/search.js --source x --responses-allowed-x-handles xai,elonmusk "query"
+./scripts/search.js --source x --x-from-date 2026-08-01 --x-to-date 2026-08-16 "query"
 ```
 
-日期使用严格 `YYYY-MM-DD`，起止边界 inclusive，只过滤 X posts，不影响并行的 Web Search、Tavily 或 Firecrawl。只配置 `from_date` 或 `to_date` 也会自动启用 `x_search`。direct xAI 明确支持日期字段；`openai-compatible` relay 是否支持取决于其 Responses tool 实现。
+`x_search` 的过滤参数放在 tool 对象上（不是 `filters`）：
 
-X handle filters 会移除一个前导 `@`、按大小写不敏感去重，并在规范化后限制 allowed/excluded 各最多 20 个。图片、视频理解参数当前仅被识别并 fail fast，不会进入请求 payload。
+```json
+{
+  "type": "x_search",
+  "allowed_x_handles": ["xai"],
+  "from_date": "2026-08-01",
+  "to_date": "2026-08-16",
+  "enable_image_understanding": true,
+  "enable_video_understanding": true
+}
+```
 
-固定推理模型或名称包含 `non-reasoning` 的模型不会发送可配置 reasoning 字段。
+- `allowed_x_handles` 与 `excluded_x_handles` 互斥；handle 会移除一个前导 `@`、按大小写不敏感去重，再检查各自 20 个的上限。
+- 日期必须是 `YYYY-MM-DD`，且 `from` 不得晚于 `to`；`2026-02-30` 这类溢出日期会被拒绝。边界均包含，只过滤 X 帖子。
+- `responsesXFromDate` / `responsesXToDate` 或对应环境变量可设置默认日期窗口；配置日期本身不会启用 X 搜索，命令行日期会覆盖同侧默认值。
+- `--x-images` / `--x-videos` 默认关闭，按 token 额外计费；`--no-x-images` / `--no-x-videos` 可关掉配置里打开的开关。
+- **命令行**的 X 过滤参数会把未显式指定的 `--source` 提升为 `both`；显式 `--source web` 与它们同时出现会报 `SEARCH_SOURCE_CONFLICT`。配置文件里的 handle 清单与媒体开关不会提升档位——它们是「X 检索运行时该怎么过滤」的偏好，不是开启一条额外计费检索通道的请求。
+- 启用 X 时会追加第二条 system message（X 证据准则），基础 prompt 仍是第一条，保持 prompt cache 前缀稳定。
+- `--responses-x-search` / `--responses-include-x-search` 保留为 `--source both` 的别名。
+- 配置项 `responsesIncludeXSearch` / `GROK_RESPONSES_INCLUDE_X_SEARCH` 已移除（2026-08-16 弃用，2026-09-08 删除）。值为 `true` 时 `loadConfig` 直接报 `CONFIG_OPTION_REMOVED`：忽略它会静默丢掉 X 检索，所以宁可失败；`false` 或缺失从来等价于不存在，不受影响。改用 `searchSource: "both"`。
+
+X 检索计费为 $5 / 1k calls，与 web search 同价；实际调用次数见 `diagnostics.responses_x_search_calls`。
 
 ## OpenRouter
 
@@ -86,7 +115,39 @@ auto | native | exa | firecrawl | parallel | perplexity
 
 模型名不会自动追加 `:online`。
 
-本项目当前不支持 OpenRouter X Search 日期过滤。为 OpenRouter 配置日期会在网络请求前返回 `RESPONSES_X_DATE_PROVIDER_UNSUPPORTED`，不会静默丢弃字段。
+OpenRouter 对 xAI 模型会**自动**把 `x_search` 挂在 native web search 上，既不能单独关闭也不能只用 X，唯一控制面是顶层 `x_search_filter`：
+
+```json
+{
+  "x_search_filter": {
+    "allowed_x_handles": ["xai"],
+    "from_date": "2026-08-01",
+    "enable_image_understanding": true
+  }
+}
+```
+
+因此 `--source` 在 OpenRouter 上只是提示。`--source x` 与 `--source web` 都会写入 `diagnostics.warnings` 说明未被强制执行；engine 非 `auto`/`native` 时 native 检索被替换，`x_search` 及其过滤器不会运行，也会告警。
+
+## 配置与命令行的优先级
+
+优先级从高到低：`--source` 等命令行参数 > 环境变量 > 配置文件 > 兜底默认。
+
+需要注意 **配置文件由使用者书写，命令行参数由调用本工具的 agent 书写**，两者作者不同。因此：
+
+- `searchSource` 等标量配置是**默认值**语义，命令行可以覆盖（包括把 `x` / `both` 覆盖回 `web`）。实际生效值始终记录在 `diagnostics.options`，可事后审计。
+- 但配置中的**限制**不会被命令行静默抹掉。allow-list 与 deny-list 都是限制：deny-list 去掉列举的值，allow-list 去掉没列举的一切。命令行只能收紧，不能放宽。
+
+| 配置 | 命令行 | 结果 |
+| --- | --- | --- |
+| deny-list | allow-list | 允许（deny 自动满足）；若显式请求了已排除的值，报 `RESPONSES_FILTER_FORBIDDEN` |
+| deny-list | deny-list | 合并去重；超过上限（domain 5 / handle 20）报 `RESPONSES_FILTER_LIMIT` |
+| allow-list | allow-list | 必须是配置清单的子集，否则报 `RESPONSES_FILTER_FORBIDDEN` |
+| allow-list | deny-list | 从配置清单里减掉；减空报 `RESPONSES_FILTER_EMPTY`（空 allow-list 对 API 等于「不限制」，与配置意图相反） |
+
+比较一律不区分大小写。
+
+本工具目前没有"命令行完全不可覆盖"的硬策略层。若确有此需求，请提 issue 说明场景。
 
 ## Responses sources
 
@@ -96,7 +157,7 @@ auto | native | exa | firecrawl | parallel | perplexity
 - `web_search_call`、`x_search_call` 的 action/query/url/source；
 - usage 与费用字段。
 
-结果进入 `sources.grok`：
+解析出的每条 source 形如：
 
 ```json
 {
@@ -109,27 +170,45 @@ auto | native | exa | firecrawl | parallel | perplexity
 
 同一 URL 同时是 `citation` 和 `searched` 时，citation 优先。
 
+X citation 只带裸 URL，且 `title` 就是 inline citation 序号（`"1"`、`"2"`）。解析器从 URL 还原署名，并丢掉这个无意义的序号标题：
+
+```json
+{
+  "provider": "grok-responses",
+  "source_type": "citation",
+  "tool": "x_search",
+  "url": "https://x.com/xai/status/2087942296721559607",
+  "title": "@xai",
+  "x_handle": "xai",
+  "x_post_id": "2087942296721559607"
+}
+```
+
+只有 `/<handle>/status/<id>` 这种形式带署名；`https://x.com/i/status/...`、`https://x.com/i/web/status/...` 只填 `x_post_id`，并且不保留序号标题。
+
+citation 本身不带产出工具信息，所以 `tool` 是推断的：**挂了 `x_search` 时**（`--source x` / `both`，以及 OpenRouter——那里 `x_search` 必然随行）X 链接标为 `x_search`；`--source web` 下不标，因为 web search 本来就会索引 x.com 页面，标成 `x_search` 等于报告一次没发生的检索。URL 还原出的 `x_handle` / `x_post_id` 与挂了哪个工具无关，始终保留。
+
 ## Tavily 与 Firecrawl
 
 它们与 Responses 请求并行，但不进入 `input`：
 
 ```text
 Grok Responses ──────────────┐
-Tavily Search（有 key）───────┼─ sources.merged
+Tavily Search（有 key）───────┼─ sources.items（去重合并 + 上限裁剪）
 Firecrawl Search（Keyless/key）┘
 ```
 
-默认合计 6 条；两家可用时 3/3。Firecrawl provider attempt 会包含 `auth_mode`，可能包含 `credits_used`。
+默认合计 6 条；两家可用时 3/3。Firecrawl provider attempt 会包含 `auth_mode`、`requests`、`duration_ms`，可能包含 `credits_used`；冷却期内为 `skipped: true`。域名过滤会下推给两家，域外结果在排序时降到最后并计入 `off_domain`。`--instructions` 不会传给两家。
 
 ## 额度错误
 
 只有明确额度信号触发 degraded success：
 
 - HTTP 402；
-- HTTP 429 且正文包含 quota、credit、balance、billing、rate limit 等信号；
+- HTTP 429 且正文包含 quota、credit、balance、billing、额度、余额等信号；
 - `insufficient_quota`、`credits_exhausted` 等错误码。
 
-降级输出同时包含人类可见警告和结构化 `diagnostics.grok_error`。`--no-extra` 时返回 `GROK_QUOTA_EXHAUSTED`。401/403、404/422、5xx、超时和空响应仍是普通错误。
+不带额度信号的 429 归为 `RATE_LIMITED`，降级行为相同但 `grok_error.code` 与 warning 文案如实区分。降级输出同时包含人类可见警告和结构化 `diagnostics.grok_error`。`--no-extra` 时返回 `GROK_QUOTA_EXHAUSTED` / `GROK_RATE_LIMITED`。401/403、404/422、5xx、超时和空响应仍是普通错误。
 
 ## Diagnostics
 
@@ -137,10 +216,17 @@ Firecrawl Search（Keyless/key）┘
 
 - `grok_endpoint: responses`
 - `responses_max_turns`
+- `search_source`（`web` / `x` / `both`）
 - `responses_web_search_calls`
 - `responses_x_search_calls`
-- `responses_x_from_date` / `responses_x_to_date`
+- `diagnostics.options.x_from_date` / `diagnostics.options.x_to_date`（启用 X 且设置日期时）
 - `responses_tool_calls`
+
+工具调用次数取 `usage.server_side_tool_usage_details`（计费口径）与 `output[]` 里 `*_call` item 统计的**逐工具较大值**。两边都不可单独信任：部分中转会计费 `x_search` 却不吐 `x_search_call` item（只看 `output[]` 会报 0），另一些会把该字段填成全 0（只看 usage 同样报 0）。`responses_tool_calls` 摘要为 `{ total, upstream: { web, x } | null, trace: { web, x }, by_action: { search, open_page, find_in_page }, failed? }`：`total` 用较大值口径，`upstream` / `trace` 保留两侧原始计数，因此 `total` 可能大于 `raw_path` 里记录的 tool call 明细条数。
+- `search_budget`：`{ prompt_total: 6, prompt_x: 0|4, used_web, used_x, used_total, exceeded, enforced: false }`。prompt 里的预算是给模型的建议，不是上限：`max_turns` 限的是 agentic turn，一个 turn 可含多次检索，而且它只对 X 搜索是硬上限、web 搜索不受它约束，所以 `enforced` 恒为 false。请求侧能压次数的只有 `parallel_tool_calls: false`（`--responses-parallel-tool-calls false`，默认不发）：官方与透传的中转上每 turn 一次调用，但只在 `responses_tool_calls.total` 常超 6 时才省钱，grok-4.6 自然只跑 3–5 次、加了不省。`max_tool_calls` 官方与中转都不生效，未接入。模型本身是最大的费用杠杆（同题 grok-4.6 的调用是 grok-4.5 的 1/3–1/4）。`cost_usd` 是端点报的 `usage.cost_in_usd_ticks`，中转与官方对同一 usage 报的数可差一倍多，跨供应商不可比。实验过程与数据见 `.agent/tool-call-cap-2026-09-08.md`。
+- `responses_model`：中转实际返回的 `model`；与请求不同时写 warning。第一个中转对每次 `grok-4.5` 请求都返回 `grok-4.5-build`，这才是它 2–3 倍调用次数的来源
+- 中转差异还包括：X 搜索以 `custom_tool_call`（`x_keyword_search` / `x_thread_fetch` …）形式返回，解析器按 `x_search` 计数并把 `by_action` 写成 `keyword_search` / `thread_fetch`；每个 turn 的过场 message（"I'll search X…"）被丢弃，`answer.text` 只取最后一条，除非前面的 message 很长或带 citation
+- `options.instructions_chars`（传了 `--instructions` 时）
 - `extra_allocation`
 - `firecrawl_auth_mode`
 - `degraded` / `grok_error`

@@ -5,78 +5,57 @@ description: Use when the user explicitly asks to search the web, check latest/c
 
 # Grok Search
 
-Node scripts for web search, URL fetch, and lightweight site mapping. Run `npm install` once if dependencies are not installed, then run the scripts directly — there is no MCP server or extension to call.
+Node scripts for web search, URL fetch and site mapping. Run `npm install` once. Run scripts from the grok-search root (the directory of this SKILL.md): `cd` there or use absolute paths.
 
 ## Choose The Script
 
-Decide before running, by what the user already gave you:
+- URL given → `scripts/fetch.js`.
+- Site named, URL unknown → `scripts/map.js`, then `fetch.js` on the URLs you pick.
+- Current/latest information, or URL unknown → `scripts/search.js`.
+- Question about the user's local machine → inspect local files first; search only to interpret them.
 
-- They gave a URL and asked what it says → `scripts/fetch.js`.
-- They named a site but no URL, and want to know what is on it → `scripts/map.js`, then `fetch.js` on the URLs you pick.
-- They want current/latest information, or the URL is unknown → `scripts/search.js`.
-
-Do not chain map → fetch → search by default. Run the fewest commands that answer the question. If sub-questions are independent (different sites, unrelated facts), launch the commands in parallel instead of sequentially.
+Run the fewest commands that answer the question; run independent sub-questions in parallel. Do not chain map → fetch → search.
 
 ## Commands
 
 ```bash
-./scripts/search.js "query"
-./scripts/search.js --platform GitHub "query"
-./scripts/search.js --extra 10 "query"
-./scripts/search.js --no-extra "query"
-./scripts/search.js --source-chars 200 "query"
-./scripts/search.js --responses-openrouter-engine exa "strict web-only query"
-./scripts/search.js --responses-x-search --responses-allowed-x-handles xai,OpenAI "query"
-./scripts/search.js --responses-x-from-date 2026-07-01 --responses-x-to-date 2026-07-31 "query"
-```
-
-```bash
-./scripts/fetch.js https://example.com
-./scripts/fetch.js --provider direct https://example.com
-```
-
-Use `./scripts/fetch.js --max-chars 50000 URL` only for an explicit deep read after the preview shows the page is worth reading.
-
-```bash
+./scripts/search.js "plain keywords"
+./scripts/search.js --instructions "what to return, language, what to leave out" "plain keywords"
+./scripts/search.js --responses-allowed-domains github.com "plain keywords"
+./scripts/search.js --source x --x-from-date 2026-07-01 "what people say about ..."
+./scripts/fetch.js https://example.com        # --max-chars 50000 only for a deliberate deep read
 ./scripts/map.js https://docs.example.com --limit 20
-./scripts/map.js --provider direct https://docs.example.com
-./scripts/map.js https://docs.example.com --instructions "only API reference pages" --max-depth 2
 ```
 
-Search is Responses-only. It runs Grok Responses alongside independent Tavily and Firecrawl searches. Tavily is used when its key is configured; Firecrawl works keyless and automatically uses `FIRECRAWL_API_KEY` when available. The default combined extra target is 6. Add `--extra 10` only for a broader candidate-source sweep. Extras are never fed into Grok.
+Query rules:
 
-X Search date filters use strict `YYYY-MM-DD` inclusive boundaries and apply only to X posts. A date filter implicitly enables `x_search`. Direct xAI supports them; Responses-compatible relays are provider-dependent, and OpenRouter is rejected locally. Image and video understanding options are recognized but unsupported and fail before any search request.
+- The query is a keyword string that Tavily/Firecrawl search verbatim, so keep it short. Everything else (fields wanted, language, "quote and date only, no advice, say if not found") goes in `--instructions`; only Grok sees it. A bag of keywords like `GPT Codex 1M 272k context window` makes Grok invent background; `codex context window` plus an instruction asking for the current limit does not.
+- No code-search operators (`repo:`, `path:`, `language:`). Scope with `--responses-allowed-domains`; it restricts Grok, Tavily, and Firecrawl alike, and off-domain leftovers rank last.
+- Budget about 2 searches per question. Before a second search, name the gap it closes. Do not carry the previous round's conclusion words into the keywords; for the same X handle, change the gap, not the phrasing.
 
-If Grok quota is explicitly exhausted, `search.js` may return a visibly marked degraded answer made from raw Tavily/Firecrawl results. Check `diagnostics.degraded` and `diagnostics.grok_error`. Other Grok failures remain errors. `--no-extra` disables this fallback as well as the external searches.
+## Search Source
+
+Default is web. `--source x` for what people are saying, a named account's posts, a thread, or a claim only circulating on X. `--source both` for a current event where reporting and reaction both matter. `--source x` cannot fall back to the web and turns Tavily/Firecrawl off (`--extra N` forces them).
+
+- For "is it available now / current state" questions, start with `--x-from-date` 60–90 days back; widen only if empty. Old issues explain history, not the present.
+- X posts are personal statements: cite handle and date (both live in `answer.text`, not the card), keep claims separate from confirmations, confirm facts at the official source.
+- Cost: when an X search reports `responses_tool_calls.total` above 6, add `--responses-parallel-tool-calls false` next time: one call per turn, so `max_turns` caps the count; below 6 it saves nothing.
+- Handle filters, dates, media flags, card fields: `references/x-search.md`.
+
+## Fetch Cost
+
+- X posts: `auto` tries Direct first (free, main post with date). `--provider firecrawl` only for the thread or replies; about 30 credits per post.
+- Fetch only evidence that would change the conclusion: one or two URLs per turn, a representative post or two for experience reports, never re-fetch text you have. Reddit and YouTube return shells from every provider.
+- When citing decisive evidence, record date, model version, client, and login method.
 
 ## Reading Results
 
-Each script writes a single JSON object to stdout. On failure it still writes JSON to stdout, a short message to stderr, and exits non-zero.
+Every script prints one JSON object, also on failure (non-zero exit, stderr line).
 
-Check in this order:
+- `error`: read `error.message`, `error.code`, `diagnostics.provider_attempts`. Change something before retrying (query, `--provider`, `--model`). `DEADLINE_EXCEEDED`: the whole command hit its time budget (default 240s, `--deadline N`).
+- `diagnostics.warnings` and `diagnostics.provider_attempts` say which providers were skipped (e.g. Firecrawl in cooldown), failed, or produced content, and whether the relay served another model than requested.
+- Search: `answer.text`, then `sources.items` (merged, max 12). `source_type` `citation` = used in the answer, `searched` = only listed; `opened: true` = Grok read the page. `sources.raw_path` always points to the run record (full list, answer, tool calls); read it in chunks only when the cards are not enough. Check `diagnostics.degraded`, `cost_usd`, and `search_budget` (advisory budget vs. calls made).
+- Fetch: `content.text`; if `content.truncated`, read `content.full_path` in chunks or rerun once with a larger `--max-chars`. `metadata` has title/author/published_at when the provider had them. `diagnostics.run_path` is the run record.
+- Map: `urls`; fetch the few you need.
 
-- `error` — if present, read `error.message`, `error.code`, `error.preview` if present, and `diagnostics.provider_attempts`. Before retrying, change something: a sharper query, a different `--provider` (fetch/map), or a different `--model` (search). Do not rerun the same command.
-- `diagnostics.warnings` and `diagnostics.provider_attempts` — these tell you which providers were skipped, failed, or produced content.
-- Search success: read `answer.text`, then `sources.merged`. Source cards are short and use `snippet`, not `description` or `content`. Full source/provider raw is in `sources.raw_path`; read it in chunks only when needed.
-- Search: inspect `diagnostics.grok_endpoint`, `diagnostics.degraded`, `diagnostics.cost_usd`, provider attempts, and `sources.grok[].source_type` (`citation` vs `searched`) before treating sources as evidence.
-- Fetch success: read `content.text`. If `content.truncated` is true and the preview is enough, stop. If more is needed, read `content.full_path` in chunks or rerun once with a deliberate larger `--max-chars`.
-- Map success: read `urls`, choose the best candidates, then fetch only the few URLs you need.
-
-Search and fetch are intentionally separated. Use search to discover and compare sources, then fetch a specific URL for deep reading. In one research turn, fetch 1-2 URLs by default; do not batch-fetch many pages unless the user explicitly asks.
-
-## Providers And Limits
-
-`fetch.js` provider order for `--provider auto`: Tavily Extract → Firecrawl Scrape → Direct Fetch.
-`map.js` provider order for `--provider auto`: Tavily Map → Direct Map.
-
-For search, Tavily requires a key while Firecrawl uses its keyless tier by default. For fetch, missing Tavily means Firecrawl Keyless runs before Direct Fetch. The direct providers do not execute JavaScript, log in, use cookies, parse PDFs, or bypass anti-bot. Direct Map only reads `/sitemap.xml` and same-domain homepage links, ignores `--instructions`, and is limited to `--max-depth 1`.
-
-## Proxy
-
-The scripts automatically use terminal proxy environment variables via undici when present: `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` and lowercase variants. `NO_PROXY` is honored, and loopback hosts are bypassed. Use `GROK_PROXY="http://127.0.0.1:7890"` to set a proxy just for this tool, or `GROK_PROXY=off` to force direct connections. If proxy debugging is needed, set `GROK_DEBUG=true`.
-
-If `search.js` returns `GROK_API_URL 未配置` or `GROK_API_KEY 未配置`, the project itself is missing required setup — point the user at `README.md` instead of trying to work around it.
-
-## When To Plan First
-
-For multi-part research, conflicting sources, or anything that needs both site discovery and page content, read `references/planning.md` before running commands.
+Provider order, proxy, cooldown, config errors: `references/providers.md`. Multi-part or conflicting research: `references/planning.md` first.

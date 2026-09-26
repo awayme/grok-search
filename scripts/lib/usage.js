@@ -1,6 +1,6 @@
 const COST_TICK_DIVISOR = 10_000_000_000;
 
-function numericField(value) {
+export function numericField(value) {
   const parsed = typeof value === "number" ? value : Number.parseFloat(value);
   return Number.isFinite(parsed) ? parsed : null;
 }

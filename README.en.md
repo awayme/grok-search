@@ -47,6 +47,7 @@ Other agent harnesses can use the same pattern: read `SKILL.md`, then run `scrip
 - [Smoke tests](docs/smoke-tests.md)
 - [Public benchmark](docs/benchmark.md)
 - [Evaluation methodology research](docs/web-search-evaluation-research.md)
+- Agent-facing: [SKILL.md](SKILL.md) (read every turn, kept under 5k chars) plus the on-demand [references/x-search.md](references/x-search.md), [references/providers.md](references/providers.md), and [references/planning.md](references/planning.md)
 
 ## Configuration
 
@@ -76,13 +77,13 @@ Full configuration example:
   "responsesReasoningEffort": "low",
   "responsesAllowedDomains": [],
   "responsesExcludedDomains": [],
-  "responsesIncludeXSearch": false,
+  "searchSource": "web",
   "responsesAllowedXHandles": [],
   "responsesExcludedXHandles": [],
   "responsesXFromDate": "",
   "responsesXToDate": "",
-  "responsesXEnableImageUnderstanding": false,
-  "responsesXEnableVideoUnderstanding": false,
+  "xImageUnderstanding": false,
+  "xVideoUnderstanding": false,
   "responsesOpenRouterEngine": "auto",
   "defaultExtra": 6,
   "sourceChars": 400,
@@ -90,7 +91,9 @@ Full configuration example:
   "tavilyApiUrl": "https://api.tavily.com",
   "firecrawlApiKey": "",
   "firecrawlApiUrl": "https://api.firecrawl.dev/v2",
-  "outputDir": ""
+  "outputDir": "",
+  "stateDir": "",
+  "runLog": true
 }
 ```
 
@@ -98,17 +101,19 @@ Common configuration rules:
 
 - `apiUrl` is the API base URL that supports `/responses`. The script requests `{apiUrl}/responses`, so do not include `/responses` itself.
 - `apiProvider` accepts exactly one value:
-  - `xai`: the official xAI endpoint, using `web_search` with optional `x_search`.
+  - `xai`: the official xAI endpoint, using `web_search` and `x_search` according to `searchSource`.
   - `openrouter`: the OpenRouter endpoint, using `openrouter:web_search`; `responsesOpenRouterEngine` selects its search engine.
   - `openai-compatible`: a relay, proxy, or compatible service that supports xAI-style Responses and the `web_search` tool. A Chat-Completions-only endpoint is not sufficient.
 - When `apiProvider` is omitted, it is inferred from the URL: URLs containing `openrouter` use `openrouter`, URLs containing `api.x.ai` use `xai`, and all others use `openai-compatible`. Set it explicitly for relay services to avoid selecting the wrong request format.
 - `model` must be an ID supported by that endpoint. `responsesMaxTurns` is an integer of at least 1. Common `responsesReasoningEffort` values are `low`, `medium`, and `high`, but support depends on the selected model and provider.
-- `responsesAllowedDomains`, `responsesExcludedDomains`, `responsesAllowedXHandles`, and `responsesExcludedXHandles` are arrays and may contain multiple values, for example `["github.com", "docs.python.org"]`. The allowed and excluded forms of the same filter are mutually exclusive. In environment variables, separate multiple values with commas.
-- X handles have one leading `@` removed and are deduplicated case-insensitively. The allowed and excluded lists each accept at most 20 normalized handles.
-- `responsesXFromDate` and `responsesXToDate` use strict `YYYY-MM-DD` dates with inclusive boundaries. They filter X posts only, not Web Search, Tavily, or Firecrawl results. Either date implicitly enables `x_search`.
-- `responsesXEnableImageUnderstanding` and `responsesXEnableVideoUnderstanding` must remain `false`; setting either to `true` returns an unsupported error before any search request.
+- `responsesAllowedDomains`, `responsesExcludedDomains`, `responsesAllowedXHandles`, and `responsesExcludedXHandles` are arrays and may contain multiple values, for example `["github.com", "docs.python.org"]`. The allowed and excluded forms of the same filter are mutually exclusive. Domains are capped at 5, X handles at 20. In environment variables, separate multiple values with commas.
+- X handles have one leading `@` removed and are deduplicated case-insensitively before the 20-handle limit is checked.
+- `searchSource` accepts `web`, `x`, or `both` and selects which search tools are attached by default; the `--source` flag takes precedence. Use `--x-from-date` / `--x-to-date` for a query-specific X date window or `responsesXFromDate` / `responsesXToDate` for a default window. Configured dates alone do not turn on X search.
+- X dates use strict `YYYY-MM-DD` with inclusive boundaries. They filter X posts only, not Web Search, Tavily, or Firecrawl results.
+- The old `responsesIncludeXSearch` / `GROK_RESPONSES_INCLUDE_X_SEARCH` option has been removed (deprecated 2026-08, removed 2026-09). A `true` value now fails with `CONFIG_OPTION_REMOVED` instead of silently dropping X search; switch to `searchSource: "both"`. `false` or absent is unaffected.
+- Precedence is CLI > environment > config file > built-in default. Note that you write the config file while the agent invoking this tool writes the CLI args: scalar settings such as `searchSource` are **defaults** the agent may override, and the value actually used is always recorded in `diagnostics.options`. Configured **restrictions**, however, are never silently discarded — allow-lists and deny-lists are both restrictions, and CLI values may only narrow them. Stepping outside one raises `RESPONSES_FILTER_FORBIDDEN`, emptying an allow-list raises `RESPONSES_FILTER_EMPTY`, and two deny-lists are merged rather than replaced. See [docs/responses-mode.md](docs/responses-mode.md#配置与命令行的优先级).
 - `responsesOpenRouterEngine` accepts `auto`, `native`, `exa`, `firecrawl`, `parallel`, or `perplexity`, and only applies when `apiProvider` is `openrouter`.
-- `tavilyApiKey` is optional. `firecrawlApiKey` may also be empty to use Firecrawl Keyless. An empty `outputDir` uses `~/.cache/grok-search/outputs/`.
+- `tavilyApiKey` is optional. `firecrawlApiKey` may also be empty to use Firecrawl Keyless. An empty `outputDir` uses `~/.cache/grok-search/outputs/`; an empty `stateDir` uses `~/.cache/grok-search/` for the Firecrawl cooldown state. `runLog: false` disables the per-run record files.
 
 For OpenRouter, replace the core fields with:
 
@@ -154,7 +159,7 @@ Supported variables:
 - `HTTPS_PROXY` / `https_proxy`
 - `ALL_PROXY` / `all_proxy`
 - `NO_PROXY` / `no_proxy`
-- `GROK_PROXY` to explicitly set one proxy URL for this tool, or `GROK_PROXY=off` to force direct connections
+- `GROK_PROXY` to explicitly set one proxy URL for this tool, or `GROK_PROXY=off` to force direct connections. An invalid explicit `GROK_PROXY` fails the command (`PROXY_CONFIG_INVALID`) instead of silently falling back to a direct connection; failures of ambient proxy variables stay non-fatal and surface via `diagnostics.options.proxy_mode` on search
 
 `NO_PROXY` is honored, and loopback hosts (`localhost`, `127.0.0.1`, `::1`) are always added to the bypass list.
 
@@ -164,25 +169,31 @@ Supported variables:
 | `GROK_API_KEY` | `apiKey` | Yes for search | `search.js` | API key for `GROK_API_URL`. |
 | `GROK_API_PROVIDER` | `apiProvider` | No | `search.js` | Selects the Responses tool request format, not an additional search source. Accepts `xai`, `openrouter`, or `openai-compatible`; inferred from the URL when omitted. |
 | `GROK_MODEL` | `model` | No | `search.js` | Defaults to `grok-4.3`. |
-| `GROK_RESPONSES_MAX_TURNS` | `responsesMaxTurns` | No | Responses | Responses agentic turn limit. Default: `3`. |
+| `GROK_RESPONSES_MAX_TURNS` | `responsesMaxTurns` | No | Responses | Responses agentic turn limit; a hard cap for X search only, web search is not bound by it. Default: `3`. |
 | `GROK_RESPONSES_REASONING_EFFORT` | `responsesReasoningEffort` | No | Responses | Default: `low`. |
+| `GROK_RESPONSES_PARALLEL_TOOL_CALLS` | `responsesParallelToolCalls` | No | Responses | `true` / `false`; not sent unless set. `false` makes Grok run one server-side tool call per turn; `api.x.ai` and relays that pass it through echo `false` and X search drops to one call per turn, so `max_turns` becomes a hard cap (2026-09-08: grok-4.5 via a relay went from 7–14 calls to 3 at a third of the cost; grok-4.6, direct or via the same relay, runs 3–4 calls on its own and gained nothing, so add it when `responses_tool_calls.total` is above 6). Relays that ignore it echo `true`. `max_tool_calls` is ignored by xAI and by relays, so it is not wired. CLI: `--responses-parallel-tool-calls false`. |
 | `GROK_RESPONSES_ALLOWED_DOMAINS` | `responsesAllowedDomains` | No | Responses | Comma-separated domain allow-list, max 5; mutually exclusive with excluded domains. |
 | `GROK_RESPONSES_EXCLUDED_DOMAINS` | `responsesExcludedDomains` | No | Responses | Comma-separated domain deny-list, max 5; mutually exclusive with allowed domains. |
-| `GROK_RESPONSES_INCLUDE_X_SEARCH` | `responsesIncludeXSearch` | No | Responses | Enables direct xAI `x_search`. Default: `false`. |
-| `GROK_RESPONSES_ALLOWED_X_HANDLES` | `responsesAllowedXHandles` | No | Responses | X handle allow-list; mutually exclusive with excluded handles. |
-| `GROK_RESPONSES_EXCLUDED_X_HANDLES` | `responsesExcludedXHandles` | No | Responses | X handle deny-list; mutually exclusive with allowed handles. |
-| `GROK_RESPONSES_X_FROM_DATE` | `responsesXFromDate` | No | xAI / compatible Responses | Inclusive X post start date in strict `YYYY-MM-DD` format. |
-| `GROK_RESPONSES_X_TO_DATE` | `responsesXToDate` | No | xAI / compatible Responses | Inclusive X post end date in strict `YYYY-MM-DD` format. |
-| `GROK_RESPONSES_X_ENABLE_IMAGE_UNDERSTANDING` | `responsesXEnableImageUnderstanding` | No | Responses | Not supported; `true` fails fast. |
-| `GROK_RESPONSES_X_ENABLE_VIDEO_UNDERSTANDING` | `responsesXEnableVideoUnderstanding` | No | Responses | Not supported; `true` fails fast. |
+| `GROK_SEARCH_SOURCE` | `searchSource` | No | Responses | Default search source: `web`, `x`, or `both`. Default: `web`. |
+| `GROK_RESPONSES_ALLOWED_X_HANDLES` | `responsesAllowedXHandles` | No | Responses | X handle allow-list, max 20; mutually exclusive with excluded handles. |
+| `GROK_RESPONSES_EXCLUDED_X_HANDLES` | `responsesExcludedXHandles` | No | Responses | X handle deny-list, max 20; mutually exclusive with allowed handles. |
+| `GROK_RESPONSES_X_FROM_DATE` | `responsesXFromDate` | No | Responses | Inclusive X post start date; applies only when X search runs. |
+| `GROK_RESPONSES_X_TO_DATE` | `responsesXToDate` | No | Responses | Inclusive X post end date; applies only when X search runs. |
+| `GROK_X_IMAGE_UNDERSTANDING` | `xImageUnderstanding` | No | Responses | Analyze images inside X posts; billed as extra tokens. Default: `false`. |
+| `GROK_X_VIDEO_UNDERSTANDING` | `xVideoUnderstanding` | No | Responses | Analyze videos inside X posts; billed as extra tokens. Default: `false`. |
 | `GROK_RESPONSES_OPENROUTER_ENGINE` | `responsesOpenRouterEngine` | No | OpenRouter Responses | `auto`, `native`, `exa`, `firecrawl`, `parallel`, or `perplexity`. Default: `auto`. |
 | `GROK_DEFAULT_EXTRA` | `defaultExtra` | No | `search.js` | Combined Tavily/Firecrawl source target. Default: `6`. |
 | `GROK_SOURCE_CHARS` | `sourceChars` | No | `search.js` | Per-source stdout snippet limit. Default: `400`; `0` omits snippets. |
+| `GROK_MAX_SOURCES` | `maxSources` | No | `search.js` | Cap on source cards returned on stdout. Default: `12`; the untruncated list is stored at `sources.raw_path`. |
+| `GROK_DEADLINE_SECONDS` | `deadlineSeconds` | No | all scripts | Whole-command deadline in seconds. Default: `240`, `0` disables; on expiry the command prints a `DEADLINE_EXCEEDED` JSON envelope before exiting. |
 | `TAVILY_API_KEY` | `tavilyApiKey` | No | `search.js`, `fetch.js`, `map.js` | Enables Tavily Search/Extract/Map. Without it, search/fetch still use Firecrawl Keyless and map uses Direct Map. |
 | `TAVILY_API_URL` | `tavilyApiUrl` | No | Tavily paths | Defaults to `https://api.tavily.com`. |
 | `FIRECRAWL_API_KEY` | `firecrawlApiKey` | No | `search.js`, `fetch.js` | Optional. Uses Firecrawl Keyless when absent; a key provides account-scoped credits and higher rate limits. |
 | `FIRECRAWL_API_URL` | `firecrawlApiUrl` | No | Firecrawl paths | Defaults to `https://api.firecrawl.dev/v2`. |
-| `GROK_OUTPUT_DIR` | `outputDir` | No | all scripts | Overrides long-output storage. Default: `~/.cache/grok-search/outputs/`. |
+| `GROK_OUTPUT_DIR` | `outputDir` | No | all scripts | Overrides long-output and run-record storage. Default: `~/.cache/grok-search/outputs/`. |
+| `GROK_STATE_DIR` | `stateDir` | No | all scripts | Cross-command state directory (Firecrawl quota cooldown file `firecrawl-cooldown.json`). Default: `~/.cache/grok-search/`. |
+| `GROK_RUN_LOG` | `runLog` | No | all scripts | Default `true`: every command writes one run-record JSON. `off` / `false` disables it, and `sources.raw_path` / `diagnostics.run_path` become null. |
+| `GROK_DEBUG_RAW` | — | No | `search.js` | Env only. `1` embeds the redacted full Grok response as `grok_raw` in the run record (`--full-sources` does the same). |
 | `GROK_DEBUG` | — | No | all scripts | Env only. `true` prints retry/cleanup/proxy debug logs to stderr. |
 | `GROK_PROXY` | — | No | all scripts | Env only. Explicit proxy URL for this tool, or `off`/`direct` to disable proxy use. |
 
@@ -190,14 +201,14 @@ X Search date filter example:
 
 ```bash
 ./scripts/search.js \
-  --responses-x-search \
-  --responses-x-from-date 2026-07-01 \
-  --responses-x-to-date 2026-07-31 \
+  --source both \
+  --x-from-date 2026-07-01 \
+  --x-to-date 2026-07-31 \
   --responses-allowed-x-handles xai,OpenAI \
   "official announcements about new reasoning models"
 ```
 
-OpenRouter uses the `openrouter:web_search` server tool and does not append `:online` to model names. This project does not currently support OpenRouter X Search date filters; configuring a date returns `RESPONSES_X_DATE_PROVIDER_UNSUPPORTED`.
+OpenRouter uses the `openrouter:web_search` server tool and does not append `:online` to model names. X dates are passed through the top-level `x_search_filter`; the active engine determines the available search behavior.
 
 ## Output Schema
 
@@ -224,30 +235,79 @@ On success, provider attempts, warnings, timestamps, and command options live un
 
 ```bash
 ./scripts/search.js "What changed in the latest Node.js LTS?"
+./scripts/search.js --instructions "Quote the official changelog with dates; say so if not found" "node lts changelog"
 ./scripts/search.js --platform GitHub "pi coding agent search skill"
+./scripts/search.js --responses-allowed-domains github.com "pi coding agent search skill"
 ./scripts/search.js --extra 10 "latest pi coding agent docs"
 ./scripts/search.js --no-extra "query"
 ./scripts/search.js --source-chars 200 "query"
+./scripts/search.js --max-sources 8 "query"
+./scripts/search.js --deadline 120 "query"
 ./scripts/search.js --full-sources "debug provider raw"
 ./scripts/search.js --responses-openrouter-engine exa "strict web-only query"
-./scripts/search.js --responses-x-search --responses-allowed-x-handles xai,OpenAI "query"
+./scripts/search.js --source x --responses-parallel-tool-calls false "query"   # one tool call per turn, cheaper
 ```
+
+`--instructions TEXT` separates "what to return" from "what to search". The query is the keyword string Tavily and Firecrawl search verbatim; the instructions are appended to the user message sent to Grok only (the system-prompt prefix is unchanged, so prompt caching is unaffected). With instructions present the query gets a `# Search query` header, otherwise a short query can be read as a stray line of the time context (Grok answered "no topic was specified" in a 2026-09-08 test). `diagnostics.options.instructions_chars` records the length and the run record stores the text; there is no config default.
+
+`--responses-allowed-domains` / `--responses-excluded-domains` apply to all three channels: Grok `web_search` filters, Tavily `include_domains` / `exclude_domains`, and Firecrawl `includeDomains` / `excludeDomains`. Off-domain extras that still come back are kept but ranked after every Grok result; `diagnostics.options.extra_domain_filter` is `pushed`, `demoted`, or `none`, and extra provider attempts carry an `off_domain` count.
+
+### Search sources
+
+`--source` selects which Grok server-side tools are attached. The default is `web`:
+
+```bash
+./scripts/search.js --source x "what is X saying about grok-4.6"   # X only
+./scripts/search.js --source both "reaction to the grok-4.6 release" # Grok routes
+./scripts/search.js --source x --responses-allowed-x-handles xai,OpenAI "query"
+./scripts/search.js --source x --x-from-date 2026-08-01 --x-to-date 2026-08-16 "query"
+./scripts/search.js --source x --x-images "query"                  # analyze post images
+```
+
+- `x_search` supports handle allow/deny lists (mutually exclusive, max 20 each), `--x-from-date` / `--x-to-date` (`YYYY-MM-DD`), and `--x-images` / `--x-videos` (off by default, billed as extra tokens; `--no-x-images` / `--no-x-videos` turn off what the config enabled).
+- A **command-line** X filter promotes an unspecified `--source` to `both`; combining one with an explicit `--source web` raises `SEARCH_SOURCE_CONFLICT`. X filters in the config file only apply once X search is on — they never switch it on by themselves.
+- `--responses-x-search` remains an alias for `--source both`.
+- X search is billed at $5 per 1k calls, the same rate as web search. See `diagnostics.responses_x_search_calls` for the actual count.
+- Tavily and Firecrawl extras only search the web, never X. On `--source x` they are off by default (`diagnostics.options.extra_mode` is `off-x-only` and a warning says so); `--extra N` turns them on, and `--source both` keeps them on.
+- OpenRouter attaches `x_search` to native web search automatically, so `--source` is only a hint there; whatever is not enforced is reported in `diagnostics.warnings`.
+
+X citations arrive as bare URLs whose `title` is only the inline citation marker, so source cards recover attribution from the URL:
+
+```json
+{
+  "provider": "grok-responses",
+  "source_type": "citation",
+  "tool": "x_search",
+  "url": "https://x.com/xai/status/2087942296721559607",
+  "title": "@xai",
+  "x_handle": "xai",
+  "x_post_id": "2087942296721559607"
+}
+```
+
+Post text and dates are not in the card; `answer.text` attributes each X claim by handle and date.
 
 `search.js` is Responses-only. It calls `{GROK_API_URL}/responses` with `stream:false`, enables the provider-native web search tool, and returns:
 
 - `answer.text`, `answer.chars`, `answer.original_chars`, `answer.truncated`, `answer.full_path`
-- `sources.grok`, `sources.extra`, and `sources.merged` compact source cards
-- `sources.raw_path` when full source/provider raw data is stored on disk
+- `sources.items`: one deduplicated, merged list of compact source cards, capped at `12` by default (`--max-sources`). Truncation order: `citation` > `opened: true` (pages Grok read via `open_page`) > in-domain extras > `searched` > off-domain extras. A URL seen on several channels becomes one card with `merged_from` listing the providers that contributed fields; placeholder titles such as `"1"` or `[2]` count as missing: a real title replaces them, otherwise `title` is omitted
+- `sources.returned` / `sources.total` / `sources.omitted` so callers always know whether the list was truncated
+- `sources.raw_path`: always set (unless `GROK_RUN_LOG=off`), pointing at the run record for this call: redacted argv, query, instructions, effective options, the full answer, the uncapped source lists, `grok_tool_calls`, and diagnostics. Errors and `DEADLINE_EXCEEDED` write one too
 - `sources.raw` only when `--full-sources` is used
-- `diagnostics.grok_endpoint`, `diagnostics.usage` / `diagnostics.cost_usd` when supplied by the provider, `diagnostics.responses_*`, `diagnostics.warnings`, `diagnostics.provider_attempts`, `diagnostics.options`, and `diagnostics.searched_at`
+- `diagnostics.responses_model`: the model the relay actually served; a warning is added when it differs from the requested one (on 2026-09-08 one relay answered every `grok-4.5` request with `grok-4.5-build`, at two to three times the tool calls and cost)
+- `diagnostics.grok_endpoint`, `diagnostics.usage` / `diagnostics.cost_usd` when supplied by the provider, `diagnostics.responses_*` (`responses_tool_calls` is a `{ total, upstream: { web, x } | null, trace: { web, x }, by_action, failed? }` summary; the full list lives in `raw_path`), `diagnostics.search_budget` (the prompt's advisory budget next to the calls actually made, `enforced: false`), `diagnostics.warnings`, `diagnostics.provider_attempts`, `diagnostics.options`, `diagnostics.duration_ms`, and `diagnostics.searched_at`
 
 By default the command starts Grok Responses, Tavily Search when configured, and Firecrawl Search in parallel. Tavily and Firecrawl remain independent evidence channels and are never injected into Grok input.
 
 `--extra N` is the combined Tavily/Firecrawl target, defaulting to `6`. Both providers split the target evenly, with odd counts favoring Tavily. Without a Tavily key, Firecrawl Keyless receives the full target. `--no-extra` strictly disables both external search channels.
 
-When Grok explicitly reports exhausted quota and extra sources are available, the command returns a degraded success with `diagnostics.degraded: true`. The visible answer states that it contains raw Tavily/Firecrawl results, while `diagnostics.grok_error` preserves the redacted upstream quota error. Authentication, protocol, and generic service failures do not trigger this fallback.
+When Grok explicitly reports exhausted quota (402, a quota error code, or a 429 whose body mentions quota / credits / billing) and extra sources are available, the command returns a degraded success with `diagnostics.degraded: true` and `grok_error.code: QUOTA_EXHAUSTED`. A plain 429 degrades the same way with `RATE_LIMITED`. The visible answer states that it contains raw Tavily/Firecrawl results, while `diagnostics.grok_error` preserves the redacted upstream error. Authentication, protocol, and generic service failures do not trigger this fallback.
 
 Firecrawl Keyless includes 1,000 credits per month and additional undisclosed daily IP limits. A free API key keeps the same monthly credits but provides higher rate limits, account-scoped usage, and access to more endpoints.
+
+When the quota is exhausted Firecrawl answers 429 with `reason: credits` and a `retry_after_seconds` that is usually hours. The scripts stop retrying and write `{ until, auth_mode, reason, hit_at }` to `<stateDir>/firecrawl-cooldown.json`. During the cooldown, `search.js` and `fetch.js --provider auto` skip Firecrawl (the provider attempt reads `skipped: true` with `cooldown until <ISO>`); search gives the slots to Tavily, or leaves extras empty with a warning when Tavily is not configured. An explicit `--provider firecrawl` still makes the request and clears the cooldown on success. Cooldowns are scoped by `auth_mode`, so adding an API key takes effect immediately.
+
+General retry rule: 408 / 429 / 5xx retry up to 3 times. A `Retry-After` (header or Firecrawl's `retry_after_seconds`) within the retry budget is honored as-is; one beyond the budget stops retrying instead of being clamped. Bad JSON, `success:false` bodies, 4xx such as 403, and scrape timeouts are requested once. Provider attempts carry `requests` (HTTP calls made) and `duration_ms`.
 
 Source cards intentionally do not include long `description` or `content` fields. They use short `snippet` fields, with full raw data available through `sources.raw_path`.
 
@@ -274,7 +334,11 @@ Direct Fetch is a best-effort fallback for normal HTTP(S) text pages. It strips 
 
 Firecrawl Scrape uses Keyless without a key and automatically sends a Bearer token when `FIRECRAWL_API_KEY` is configured. The active mode is exposed as `diagnostics.firecrawl_auth_mode`.
 
-Successful fetch output uses `content.text`, `content.chars`, `content.original_chars`, `content.truncated`, and `content.full_path`, with provider details under `diagnostics`.
+X posts (`x.com/<handle>/status/<id>`) under `--provider auto` try Direct first regardless of keys, and count as success only when the page names the handle, carries a date, and has non-boilerplate text (main post only). If validation fails the normal Tavily → Firecrawl order runs; if that is unavailable too, the Direct text is returned with a warning. The 2026-09-08 side-by-side is the reason: Tavily is fast and free but returned one of three posts without a date and timed out on another; Firecrawl costs about 30 credits and 10+ seconds per post in exchange for ISO timestamps, engagement counts and the thread. Use `--provider firecrawl` explicitly when you need the thread. Any fetch with `credits_used >= 10` adds a cost warning to `diagnostics.warnings`.
+
+X redirects `/<anyhandle>/status/<id>` to the real handle; validation uses the redirected URL.
+
+Successful fetch output uses `content.text`, `content.chars`, `content.original_chars`, `content.truncated`, and `content.full_path`. `metadata` is normalized to `{ title, description, author, published_at, language, status, source_url }` from Firecrawl plus Direct's `status / content_type / content_length / content_disposition`. Provider details live under `diagnostics`, and the run record path under `diagnostics.run_path`.
 
 ## Map
 
@@ -292,7 +356,9 @@ Tavily Map -> Direct Map
 
 Without `TAVILY_API_KEY`, Tavily Map is unavailable and `map.js` falls back to Direct Map. Direct Map only checks same-site `/sitemap.xml`, then same-domain links on the homepage. It ignores `--instructions` and supports only `--max-depth 1`.
 
-Successful map output uses `urls` for discovered URLs. Provider, response time, ignored instructions, warnings, attempts, and options live under `diagnostics`.
+`--timeout` (default 150s) is the crawl budget handed to Tavily Map; Direct Map's own requests for the sitemap and home page use a separate `--direct-timeout` (default 30s), so one stalled request cannot consume most of the command deadline. Both values are recorded in `diagnostics.options`.
+
+Successful map output uses `urls` for discovered URLs. Provider, response time, ignored instructions, warnings, attempts, and options live under `diagnostics`, with the run record path under `diagnostics.run_path`.
 
 ## Output Files
 
@@ -304,11 +370,14 @@ All scripts keep stdout as complete JSON. Long text fields are returned as previ
 
 Set `GROK_OUTPUT_DIR` to override this path. Each run performs best-effort cleanup of `grok-search-*` files older than 30 days inside the output directory.
 
+Besides overflow files, every command writes one run record `grok-search-<ts>-run-<kind>-<label>-<rand>.json` (`schema_version: 2`, mode 0600) on success, error, and `DEADLINE_EXCEEDED`; `GROK_RUN_LOG=off` or `runLog: false` disables it. Search records hold redacted argv, query, instructions, effective options, the full answer, uncapped sources, `grok_tool_calls`, and diagnostics; fetch records hold the full content, metadata, and provider attempts; map records hold urls. `GROK_DEBUG_RAW=1` or `--full-sources` adds `grok_raw`.
+
 Read these paths only when the preview is not enough:
 
 - `answer.full_path` for full search answers
 - `content.full_path` for full fetched page text
-- `sources.raw_path` for full source/provider raw data
+- `sources.raw_path` for the search run record (full source lists / provider raw)
+- `diagnostics.run_path` for the fetch / map run record
 
 ## Smoke Tests
 
@@ -320,6 +389,9 @@ No key required:
 node tests/sources.test.js
 node tests/proxy.test.js
 node tests/responses.test.js
+node tests/output.test.js
+node tests/retry.test.js
+node tests/firecrawl.test.js
 node tests/argv.test.js
 ```
 
@@ -336,6 +408,8 @@ export GROK_API_KEY="your-key"
 - `GROK_API_URL 未配置`: set `GROK_API_URL` before using `search.js`.
 - `GROK_API_KEY 未配置`: set `GROK_API_KEY` before using `search.js`.
 - `GROK_QUOTA_EXHAUSTED`: Grok quota is exhausted and extras are disabled, or neither Tavily nor Firecrawl produced a usable fallback result.
+- `GROK_RATE_LIMITED`: Grok returned a plain 429 (no quota signal) and no fallback result was available.
+- A provider attempt with `skipped: true` and `cooldown until …`: Firecrawl is in its post-quota cooldown. Delete `<stateDir>/firecrawl-cooldown.json` or pass `--provider firecrawl` explicitly to force a retry.
 - `TAVILY_API_KEY 未配置`: explicit `--provider tavily` was requested without a Tavily key.
 - Direct Fetch returns binary/attachment errors: the URL is not a text page or is too large for the direct fallback.
 - Direct Map returns few or zero URLs: the site may rely on JavaScript, hide links, or have no public sitemap.

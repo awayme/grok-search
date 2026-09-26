@@ -12,16 +12,22 @@ export class ConfigError extends Error {
 
 const DEFAULT_MODEL = "grok-4.3";
 const DEFAULT_EXTRA = 6;
-const DEFAULT_SOURCE_CHARS = 400;
+export const DEFAULT_SOURCE_CHARS = 400;
+export const DEFAULT_MAX_SOURCES = 12;
+const DEFAULT_DEADLINE_SECONDS = 240;
 const DEFAULT_TAVILY_API_URL = "https://api.tavily.com";
 const DEFAULT_FIRECRAWL_API_URL = "https://api.firecrawl.dev/v2";
-const DEFAULT_OUTPUT_DIR = path.join(homedir(), ".cache", "grok-search", "outputs");
+const DEFAULT_STATE_DIR = path.join(homedir(), ".cache", "grok-search");
+const DEFAULT_OUTPUT_DIR = path.join(DEFAULT_STATE_DIR, "outputs");
 const DEFAULT_OUTPUT_RETENTION_DAYS = 30;
 const DEFAULT_RESPONSES_MAX_TURNS = 3;
 const DEFAULT_RESPONSES_REASONING_EFFORT = "low";
 const DEFAULT_RESPONSES_OPENROUTER_ENGINE = "auto";
+const DEFAULT_SEARCH_SOURCE = "web";
 const API_PROVIDERS = new Set(["xai", "openrouter", "openai-compatible"]);
 const OPENROUTER_SEARCH_ENGINES = new Set(["auto", "native", "exa", "firecrawl", "parallel", "perplexity"]);
+const SEARCH_SOURCES = new Set(["web", "x", "both"]);
+export const X_HANDLE_LIMIT = 20;
 
 function env(name) {
   const value = process.env[name];
@@ -73,10 +79,17 @@ export function configFilePath() {
 }
 
 export async function loadConfigFile() {
+  let text;
   try {
-    return JSON.parse(await readFile(configFilePath(), "utf8"));
-  } catch {
-    return {};
+    text = await readFile(configFilePath(), "utf8");
+  } catch (error) {
+    if (error.code === "ENOENT" || error.code === "ENOTDIR") return {};
+    throw new ConfigError(`无法读取配置文件 ${configFilePath()}: ${error.message}`, "CONFIG_FILE_INVALID");
+  }
+  try {
+    return JSON.parse(text);
+  } catch (error) {
+    throw new ConfigError(`配置文件 ${configFilePath()} 不是有效 JSON: ${error.message}`, "CONFIG_FILE_INVALID");
   }
 }
 
@@ -139,6 +152,20 @@ export function normalizeApiProvider(value, grokApiUrl) {
   throw new ConfigError(`GROK_API_PROVIDER 必须是: ${[...API_PROVIDERS].join(", ")}`, "GROK_API_PROVIDER_INVALID");
 }
 
+export function normalizeSearchSource(value) {
+  const source = String(value || DEFAULT_SEARCH_SOURCE).trim().toLowerCase();
+  if (SEARCH_SOURCES.has(source)) return source;
+  throw new ConfigError(`search source 必须是: ${[...SEARCH_SOURCES].join(", ")}`, "SEARCH_SOURCE_INVALID");
+}
+
+export function usesXSearch(searchSource) {
+  return searchSource === "x" || searchSource === "both";
+}
+
+export function usesWebSearch(searchSource) {
+  return searchSource === "web" || searchSource === "both";
+}
+
 export function normalizeOpenRouterSearchEngine(value) {
   const engine = String(value || DEFAULT_RESPONSES_OPENROUTER_ENGINE).trim().toLowerCase();
   if (OPENROUTER_SEARCH_ENGINES.has(engine)) return engine;
@@ -148,8 +175,27 @@ export function normalizeOpenRouterSearchEngine(value) {
   );
 }
 
+// Options removed after a deprecation window. A truthy value used to change results (it
+// attached X search), so ignoring it would fail silently; refuse to start instead. A false or
+// missing value never did anything and stays accepted.
+const REMOVED_OPTIONS = [
+  {
+    env: "GROK_RESPONSES_INCLUDE_X_SEARCH",
+    keys: ["responsesIncludeXSearch", "responses_include_x_search", "GROK_RESPONSES_INCLUDE_X_SEARCH"],
+    replacement: 'searchSource: "both"（或 GROK_SEARCH_SOURCE=both / --source both）',
+  },
+];
+
+function rejectRemovedOptions(fileConfig) {
+  for (const option of REMOVED_OPTIONS) {
+    if (!envOrFileBool(option.env, fileConfig, option.keys, false)) continue;
+    throw new ConfigError(`${option.keys[0]} / ${option.env} 已移除，请改用 ${option.replacement}`, "CONFIG_OPTION_REMOVED");
+  }
+}
+
 export async function loadConfig({ requireGrok = false } = {}) {
   const fileConfig = await loadConfigFile();
+  rejectRemovedOptions(fileConfig);
   const grokApiUrl = envOrFile("GROK_API_URL", fileConfig, ["GROK_API_URL", "grokApiUrl", "grok_api_url", "apiUrl", "api_url"]);
   const grokApiKey = envOrFile("GROK_API_KEY", fileConfig, ["GROK_API_KEY", "grokApiKey", "grok_api_key", "apiKey", "api_key"]);
   const rawApiProvider = envOrFile("GROK_API_PROVIDER", fileConfig, [
@@ -177,6 +223,11 @@ export async function loadConfig({ requireGrok = false } = {}) {
   const outputDir = resolveUserPath(
     envOrFile("GROK_OUTPUT_DIR", fileConfig, ["GROK_OUTPUT_DIR", "outputDir", "output_dir"], DEFAULT_OUTPUT_DIR)
   );
+  // Small cross-command state (provider cooldowns). Kept outside outputDir so the retention
+  // sweep never deletes it.
+  const stateDir = resolveUserPath(
+    envOrFile("GROK_STATE_DIR", fileConfig, ["GROK_STATE_DIR", "stateDir", "state_dir"], DEFAULT_STATE_DIR)
+  );
 
   return {
     grokApiUrl,
@@ -189,6 +240,13 @@ export async function loadConfig({ requireGrok = false } = {}) {
       ["GROK_RESPONSES_MAX_TURNS", "responsesMaxTurns", "responses_max_turns"],
       DEFAULT_RESPONSES_MAX_TURNS,
       { min: 1 }
+    ),
+    // null = not sent; the relay decides. false is a cost lever where the relay passes it through.
+    responsesParallelToolCalls: envOrFileBool(
+      "GROK_RESPONSES_PARALLEL_TOOL_CALLS",
+      fileConfig,
+      ["GROK_RESPONSES_PARALLEL_TOOL_CALLS", "responsesParallelToolCalls", "responses_parallel_tool_calls"],
+      null
     ),
     responsesReasoningEffort: envOrFile(
       "GROK_RESPONSES_REASONING_EFFORT",
@@ -206,11 +264,12 @@ export async function loadConfig({ requireGrok = false } = {}) {
       "responsesExcludedDomains",
       "responses_excluded_domains",
     ]),
-    responsesIncludeXSearch: envOrFileBool("GROK_RESPONSES_INCLUDE_X_SEARCH", fileConfig, [
-      "GROK_RESPONSES_INCLUDE_X_SEARCH",
-      "responsesIncludeXSearch",
-      "responses_include_x_search",
-    ], false),
+    responsesSearchSource: envOrFile(
+      "GROK_SEARCH_SOURCE",
+      fileConfig,
+      ["GROK_SEARCH_SOURCE", "searchSource", "search_source"],
+      ""
+    ),
     responsesAllowedXHandles: envOrFileList("GROK_RESPONSES_ALLOWED_X_HANDLES", fileConfig, [
       "GROK_RESPONSES_ALLOWED_X_HANDLES",
       "responsesAllowedXHandles",
@@ -231,26 +290,16 @@ export async function loadConfig({ requireGrok = false } = {}) {
       "responsesXToDate",
       "responses_x_to_date",
     ]),
-    responsesXEnableImageUnderstanding: envOrFileBool(
-      "GROK_RESPONSES_X_ENABLE_IMAGE_UNDERSTANDING",
-      fileConfig,
-      [
-        "GROK_RESPONSES_X_ENABLE_IMAGE_UNDERSTANDING",
-        "responsesXEnableImageUnderstanding",
-        "responses_x_enable_image_understanding",
-      ],
-      false
-    ),
-    responsesXEnableVideoUnderstanding: envOrFileBool(
-      "GROK_RESPONSES_X_ENABLE_VIDEO_UNDERSTANDING",
-      fileConfig,
-      [
-        "GROK_RESPONSES_X_ENABLE_VIDEO_UNDERSTANDING",
-        "responsesXEnableVideoUnderstanding",
-        "responses_x_enable_video_understanding",
-      ],
-      false
-    ),
+    responsesXImageUnderstanding: envOrFileBool("GROK_X_IMAGE_UNDERSTANDING", fileConfig, [
+      "GROK_X_IMAGE_UNDERSTANDING",
+      "xImageUnderstanding",
+      "x_image_understanding",
+    ], false),
+    responsesXVideoUnderstanding: envOrFileBool("GROK_X_VIDEO_UNDERSTANDING", fileConfig, [
+      "GROK_X_VIDEO_UNDERSTANDING",
+      "xVideoUnderstanding",
+      "x_video_understanding",
+    ], false),
     responsesOpenRouterEngine: envOrFile(
       "GROK_RESPONSES_OPENROUTER_ENGINE",
       fileConfig,
@@ -277,8 +326,24 @@ export async function loadConfig({ requireGrok = false } = {}) {
     sourceChars: envOrFileInt("GROK_SOURCE_CHARS", fileConfig, ["GROK_SOURCE_CHARS", "sourceChars", "source_chars"], DEFAULT_SOURCE_CHARS, {
       min: 0,
     }),
+    maxSources: envOrFileInt("GROK_MAX_SOURCES", fileConfig, ["GROK_MAX_SOURCES", "maxSources", "max_sources"], DEFAULT_MAX_SOURCES, {
+      min: 1,
+    }),
+    deadlineSeconds: envOrFileInt(
+      "GROK_DEADLINE_SECONDS",
+      fileConfig,
+      ["GROK_DEADLINE_SECONDS", "deadlineSeconds", "deadline_seconds"],
+      DEFAULT_DEADLINE_SECONDS,
+      { min: 0 }
+    ),
     outputDir,
+    stateDir,
     outputRetentionDays: DEFAULT_OUTPUT_RETENTION_DAYS,
+    // One JSON record per command (query, options, answer, sources, usage, errors) so a run
+    // can be replayed without a session export. `GROK_RUN_LOG=off` disables it.
+    runLog: envOrFileBool("GROK_RUN_LOG", fileConfig, ["GROK_RUN_LOG", "runLog", "run_log"], true),
+    // Also keep the raw Grok Responses body inside the run record.
+    debugRaw: envBool("GROK_DEBUG_RAW", false),
     debug: envBool("GROK_DEBUG", false),
   };
 }

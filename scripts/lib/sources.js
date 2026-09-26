@@ -1,12 +1,75 @@
-const URL_PATTERN = /https?:\/\/[^\s<>"'`，。、；：！？》）】)]+/g;
-const MD_LINK_PATTERN = /\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g;
-const SOURCES_HEADING_PATTERN =
-  /^(?:#{1,6}\s*)?(?:\*\*|__)?\s*(sources?|references?|citations?|信源|参考资料|参考|引用|来源列表|来源)\s*(?:\*\*|__)?(?:\s*[（(][^)\n]*[)）])?\s*[:：]?\s*$/gim;
-const SOURCES_FUNCTION_PATTERN =
-  /(^|\n)\s*(sources|source|citations|citation|references|reference|citation_card|source_cards|source_card)\s*\(/gim;
+const X_HOST_PATTERN = /^(?:www\.|mobile\.|m\.)?(?:x\.com|twitter\.com)$/i;
+// Path segments X reserves for its own routes; none of them is a user handle.
+const X_RESERVED_HANDLES = new Set([
+  "i",
+  "home",
+  "explore",
+  "notifications",
+  "messages",
+  "search",
+  "settings",
+  "compose",
+  "intent",
+  "hashtag",
+  "share",
+  "status",
+  "statuses",
+  "about",
+  "tos",
+  "privacy",
+  "login",
+  "logout",
+  "signup",
+  "download",
+  "jobs",
+]);
 
 function trimUrl(value) {
   return String(value || "").replace(/[.,;:!?，。、；：！？》）】)]+$/g, "");
+}
+
+function xHandleSegment(segment) {
+  const handle = String(segment || "").trim();
+  if (!handle || X_RESERVED_HANDLES.has(handle.toLowerCase())) return "";
+  return /^[A-Za-z0-9_]{1,15}$/.test(handle) ? handle : "";
+}
+
+/**
+ * Extract the handle and post id an X citation carries in its URL. Grok returns X
+ * citations as bare URLs whose title is only the inline citation marker, so the URL
+ * is the sole free source of attribution.
+ */
+export function parseXPostUrl(url) {
+  let parsed;
+  try {
+    parsed = new URL(trimUrl(String(url || "").trim()));
+  } catch {
+    return null;
+  }
+
+  if (!X_HOST_PATTERN.test(parsed.hostname)) return null;
+  const segments = parsed.pathname.split("/").filter(Boolean);
+  const statusIndex = segments.findIndex((segment) => segment === "status" || segment === "statuses");
+
+  if (statusIndex < 1) {
+    const handle = segments.length === 1 ? xHandleSegment(segments[0]) : "";
+    return handle ? { x_handle: handle } : null;
+  }
+
+  const postId = segments[statusIndex + 1];
+  if (!/^\d+$/.test(postId || "")) return null;
+  // Only /<handle>/status/<id> names its author. Deeper forms such as /i/web/status/<id>
+  // put an internal route segment there, which must not be read as a handle.
+  const handle = statusIndex === 1 ? xHandleSegment(segments[0]) : "";
+  return { ...(handle ? { x_handle: handle } : {}), x_post_id: postId };
+}
+
+export function isXUrl(url) {
+  try {
+    return X_HOST_PATTERN.test(new URL(trimUrl(String(url || "").trim())).hostname);
+  } catch {
+    return false;
+  }
 }
 
 export function normalizeSourceUrl(url) {
@@ -23,20 +86,70 @@ export function normalizeSourceUrl(url) {
   }
 }
 
-export function extractUniqueUrls(text) {
-  const seen = new Set();
-  const urls = [];
-  for (const match of String(text || "").matchAll(URL_PATTERN)) {
-    const url = trimUrl(match[0]);
-    if (!url || seen.has(url)) continue;
-    seen.add(url);
-    urls.push(url);
+function textField(value) {
+  return typeof value === "string" && value.trim() ? value.trim() : "";
+}
+
+/**
+ * Grok's url_citation annotations carry the inline marker ("1", "[2]") as their title. It
+ * says nothing about the page, so any real title must be allowed to replace it.
+ */
+export function isCitationMarker(title) {
+  return /^\[?\d+\]?$/.test(String(title || "").trim());
+}
+
+function hasUsableTitle(source) {
+  const title = textField(source?.title);
+  return Boolean(title) && !isCitationMarker(title);
+}
+
+function sourceSnippet(source) {
+  return textField(source?.snippet) || textField(source?.description) || textField(source?.content);
+}
+
+/**
+ * Fill what the first record of a URL lacks from a later duplicate. A Grok citation arrives
+ * as a bare URL with a marker title; the same page found by Tavily or Firecrawl has a title
+ * and a description. Dropping the duplicate threw both away.
+ */
+function mergeSourceFields(existing, incoming) {
+  const out = { ...existing };
+  let merged = false;
+
+  if (!hasUsableTitle(out) && hasUsableTitle(incoming)) {
+    out.title = textField(incoming.title);
+    merged = true;
   }
-  return urls;
+  if (!sourceSnippet(out) && sourceSnippet(incoming)) {
+    out.snippet = sourceSnippet(incoming);
+    merged = true;
+  }
+  for (const key of ["published_date", "x_handle", "x_post_id"]) {
+    if (!textField(out[key]) && textField(incoming[key])) {
+      out[key] = textField(incoming[key]);
+      merged = true;
+    }
+  }
+  if (!Number.isFinite(out.score) && Number.isFinite(incoming.score)) {
+    out.score = incoming.score;
+    merged = true;
+  }
+  if (incoming.opened === true && out.opened !== true) {
+    out.opened = true;
+    merged = true;
+  }
+
+  if (merged) {
+    const provider = textField(incoming.provider);
+    if (provider && provider !== textField(out.provider)) {
+      out.merged_from = [...new Set([...(out.merged_from || []), provider])];
+    }
+  }
+  return out;
 }
 
 export function mergeSources(...sourceLists) {
-  const seen = new Set();
+  const indexByKey = new Map();
   const merged = [];
 
   for (const sources of sourceLists) {
@@ -44,21 +157,17 @@ export function mergeSources(...sourceLists) {
       const url = typeof item?.url === "string" ? item.url.trim() : "";
       if (!url) continue;
       const key = normalizeSourceUrl(url);
-      if (seen.has(key)) continue;
-      seen.add(key);
-      merged.push({ ...item, url });
+      const existingIndex = indexByKey.get(key);
+      if (existingIndex == null) {
+        indexByKey.set(key, merged.length);
+        merged.push({ ...item, url });
+        continue;
+      }
+      merged[existingIndex] = mergeSourceFields(merged[existingIndex], item);
     }
   }
 
   return merged;
-}
-
-function textField(value) {
-  return typeof value === "string" && value.trim() ? value.trim() : "";
-}
-
-function sourceSnippet(source) {
-  return textField(source?.snippet) || textField(source?.description) || textField(source?.content);
 }
 
 function clipText(value, maxChars) {
@@ -84,8 +193,16 @@ export function compactSource(source, { sourceChars = 400 } = {}) {
   const sourceType = textField(source?.source_type);
   if (sourceType) out.source_type = sourceType;
 
+  if (source?.opened === true) out.opened = true;
+
   const tool = textField(source?.tool);
   if (tool) out.tool = tool;
+
+  const xHandle = textField(source?.x_handle);
+  if (xHandle) out.x_handle = xHandle;
+
+  const xPostId = textField(source?.x_post_id);
+  if (xPostId) out.x_post_id = xPostId;
 
   const snippet = clipText(sourceSnippet(source), sourceChars);
   if (snippet) out.snippet = snippet;
@@ -95,6 +212,8 @@ export function compactSource(source, { sourceChars = 400 } = {}) {
   const publishedDate = textField(source?.published_date);
   if (publishedDate) out.published_date = publishedDate;
 
+  if (Array.isArray(source?.merged_from) && source.merged_from.length) out.merged_from = [...source.merged_from];
+
   return out;
 }
 
@@ -102,35 +221,73 @@ export function compactSources(sources, options = {}) {
   return (sources || []).map((source) => compactSource(source, options)).filter(Boolean);
 }
 
-export function hasRawSourceValue(source, compacted = compactSource(source)) {
-  if (!source || !compacted) return false;
+export function hostMatchesDomain(host, domain) {
+  const h = String(host || "").toLowerCase();
+  const d = String(domain || "")
+    .toLowerCase()
+    .replace(/^https?:\/\//, "")
+    .replace(/\/.*$/, "")
+    .replace(/^\*\./, "");
+  if (!h || !d) return false;
+  return h === d || h.endsWith(`.${d}`);
+}
 
-  for (const [key, value] of Object.entries(source)) {
-    if (value == null) continue;
-
-    if (key === "provider" && textField(value) === compacted.provider) continue;
-    if (key === "url" && trimUrl(String(value).trim()) === compacted.url) continue;
-    if (key === "title" && textField(value) === compacted.title) continue;
-    if (key === "source_type" && textField(value) === compacted.source_type) continue;
-    if (key === "tool" && textField(value) === compacted.tool) continue;
-    if (key === "score" && Number.isFinite(value) && value === compacted.score) continue;
-    if (key === "published_date" && textField(value) === compacted.published_date) continue;
-
-    if (key === "snippet" || key === "description" || key === "content") {
-      const rawText = textField(value);
-      if (!rawText) continue;
-      if (compacted.snippet === rawText) continue;
-      return true;
-    }
-
-    return true;
+export function urlInDomains(url, domains) {
+  if (!Array.isArray(domains) || !domains.length) return false;
+  let host;
+  try {
+    host = new URL(trimUrl(String(url || "").trim())).hostname;
+  } catch {
+    return false;
   }
+  return domains.some((domain) => hostMatchesDomain(host, domain));
+}
 
+function isExtraSource(source) {
+  return !textField(source?.source_type);
+}
+
+/**
+ * An extra-provider result that falls outside the domain filters the caller gave Grok. The
+ * providers get the same filters, so these only appear when one of them leaks; they are
+ * kept but ranked last so they cannot displace in-scope candidates.
+ */
+export function isOffDomainExtra(source, { allowedDomains = [], excludedDomains = [] } = {}) {
+  if (!isExtraSource(source)) return false;
+  if (allowedDomains.length && !urlInDomains(source?.url, allowedDomains)) return true;
+  if (excludedDomains.length && urlInDomains(source?.url, excludedDomains)) return true;
   return false;
 }
 
-export function hasRawSourceValues(rawSources, compactedSources) {
-  return (rawSources || []).some((source, index) => hasRawSourceValue(source, compactedSources?.[index]));
+/**
+ * Ranking for the visible cards: cited > opened by Grok > extra providers > merely listed by
+ * a search > extra results outside the requested domains.
+ */
+function sourceRank(source, filters) {
+  const type = textField(source?.source_type);
+  if (type === "citation") return 0;
+  if (source?.opened === true) return 1;
+  if (type === "searched") return 3;
+  return isOffDomainExtra(source, filters) ? 4 : 2;
+}
+
+export function selectSources(sources, { maxSources, allowedDomains = [], excludedDomains = [] } = {}) {
+  const list = sources || [];
+  const total = list.length;
+  const limit = Number.isFinite(maxSources) && maxSources > 0 ? maxSources : total;
+  const filters = { allowedDomains, excludedDomains };
+
+  let items = list;
+  if (total > limit) {
+    items = list
+      .map((source, index) => ({ source, index, rank: sourceRank(source, filters) }))
+      .sort((a, b) => a.rank - b.rank || a.index - b.index)
+      .slice(0, limit)
+      .sort((a, b) => a.index - b.index)
+      .map((entry) => entry.source);
+  }
+
+  return { items, total, returned: items.length, omitted: total - items.length };
 }
 
 export function buildRawSourcesPayload({
@@ -139,6 +296,7 @@ export function buildRawSourcesPayload({
   extra = [],
   providerRaw = {},
   providerAttempts = [],
+  grokToolCalls = [],
   createdAt = new Date().toISOString(),
 } = {}) {
   const provider_raw = {};
@@ -152,255 +310,15 @@ export function buildRawSourcesPayload({
     extra,
     provider_raw,
     provider_attempts: providerAttempts || [],
+    ...(grokToolCalls?.length ? { grok_tool_calls: grokToolCalls } : {}),
     created_at: createdAt,
   };
 }
 
-export function splitAnswerAndSources(text) {
-  const raw = String(text || "").trim();
-  if (!raw) return { answer: "", sources: [] };
-
-  return (
-    splitFunctionCallSources(raw) ||
-    splitHeadingSources(raw) ||
-    splitDetailsBlockSources(raw) ||
-    splitTailLinkBlock(raw) || { answer: raw, sources: [] }
-  );
-}
-
-export function extractSources(text) {
-  return extractSourcesFromText(text);
-}
-
-function splitFunctionCallSources(text) {
-  const matches = [...text.matchAll(SOURCES_FUNCTION_PATTERN)];
-  if (!matches.length) return null;
-
-  for (let i = matches.length - 1; i >= 0; i -= 1) {
-    const match = matches[i];
-    const openParenIndex = match.index + match[0].length - 1;
-    const extracted = extractBalancedCallAtEnd(text, openParenIndex);
-    if (!extracted) continue;
-
-    const sources = parseSourcesPayload(extracted.argsText);
-    if (!sources.length) continue;
-    return { answer: text.slice(0, match.index).trimEnd(), sources };
-  }
-
-  return null;
-}
-
-function extractBalancedCallAtEnd(text, openParenIndex) {
-  if (openParenIndex < 0 || text[openParenIndex] !== "(") return null;
-
-  let depth = 1;
-  let inString = null;
-  let escape = false;
-
-  for (let index = openParenIndex + 1; index < text.length; index += 1) {
-    const char = text[index];
-    if (inString) {
-      if (escape) {
-        escape = false;
-        continue;
-      }
-      if (char === "\\") {
-        escape = true;
-        continue;
-      }
-      if (char === inString) inString = null;
-      continue;
-    }
-
-    if (char === "'" || char === '"') {
-      inString = char;
-      continue;
-    }
-    if (char === "(") {
-      depth += 1;
-      continue;
-    }
-    if (char === ")") {
-      depth -= 1;
-      if (depth === 0) {
-        if (text.slice(index + 1).trim()) return null;
-        return { closeParenIndex: index, argsText: text.slice(openParenIndex + 1, index) };
-      }
-    }
-  }
-
-  return null;
-}
-
-function splitHeadingSources(text) {
-  const matches = [...text.matchAll(SOURCES_HEADING_PATTERN)];
-  if (!matches.length) return null;
-
-  for (let i = matches.length - 1; i >= 0; i -= 1) {
-    const match = matches[i];
-    const sourcesText = text.slice(match.index);
-    const sources = extractSourcesFromText(sourcesText);
-    if (!sources.length) continue;
-    return { answer: text.slice(0, match.index).trimEnd(), sources };
-  }
-
-  return null;
-}
-
-function splitDetailsBlockSources(text) {
-  const lower = text.toLowerCase();
-  const closeIndex = lower.lastIndexOf("</details>");
-  if (closeIndex === -1) return null;
-  if (text.slice(closeIndex + "</details>".length).trim()) return null;
-
-  const openIndex = lower.lastIndexOf("<details", closeIndex);
-  if (openIndex === -1) return null;
-
-  const blockText = text.slice(openIndex, closeIndex + "</details>".length);
-  const sources = extractSourcesFromText(blockText);
-  if (sources.length < 2) return null;
-  return { answer: text.slice(0, openIndex).trimEnd(), sources };
-}
-
-function splitTailLinkBlock(text) {
-  const lines = text.split(/\r?\n/);
-  let index = lines.length - 1;
-  while (index >= 0 && !lines[index].trim()) index -= 1;
-  if (index < 0) return null;
-
-  const tailEnd = index;
-  let linkLikeCount = 0;
-  while (index >= 0) {
-    const line = lines[index].trim();
-    if (!line) {
-      index -= 1;
-      continue;
-    }
-    if (!isLinkOnlyLine(line)) break;
-    linkLikeCount += 1;
-    index -= 1;
-  }
-
-  const tailStart = index + 1;
-  if (linkLikeCount < 2) return null;
-
-  const blockText = lines.slice(tailStart, tailEnd + 1).join("\n");
-  const sources = extractSourcesFromText(blockText);
-  if (!sources.length) return null;
-  return { answer: lines.slice(0, tailStart).join("\n").trimEnd(), sources };
-}
-
-function isLinkOnlyLine(line) {
-  const stripped = line.replace(/^\s*(?:[-*]|\d+\.)\s*/, "").trim();
-  if (!stripped) return false;
-  return stripped.startsWith("http://") || stripped.startsWith("https://") || /\[[^\]]+\]\(https?:\/\/[^)]+\)/.test(stripped);
-}
-
-function parseSourcesPayload(payload) {
-  const raw = String(payload || "").trim().replace(/;$/, "");
-  if (!raw) return [];
-
-  const parsed = parseJsonish(raw);
-  if (parsed == null) return extractSourcesFromText(raw);
-
-  if (isPlainObject(parsed)) {
-    for (const key of ["sources", "citations", "references", "urls"]) {
-      if (Object.prototype.hasOwnProperty.call(parsed, key)) {
-        return normalizeSources(parsed[key]);
-      }
-    }
-  }
-
-  return normalizeSources(parsed);
-}
-
-function parseJsonish(raw) {
-  try {
-    return JSON.parse(raw);
-  } catch {
-    // Continue with a deliberately narrow JS/Python-literal compatibility pass.
-  }
-
-  const normalized = raw
-    .replace(/([{,]\s*)([A-Za-z_][A-Za-z0-9_]*)\s*:/g, '$1"$2":')
-    .replace(/\bTrue\b/g, "true")
-    .replace(/\bFalse\b/g, "false")
-    .replace(/\bNone\b/g, "null")
-    .replace(/'([^'\\]*(?:\\.[^'\\]*)*)'/g, (_match, value) => JSON.stringify(value.replace(/\\'/g, "'")));
-
-  try {
-    return JSON.parse(normalized);
-  } catch {
-    return null;
-  }
-}
-
-function normalizeSources(data) {
-  const items = Array.isArray(data) ? data : [data];
-  const normalized = [];
-  const seen = new Set();
-
-  for (const item of items) {
-    if (typeof item === "string") {
-      for (const url of extractUniqueUrls(item)) pushSource(normalized, seen, { url });
-      continue;
-    }
-
-    if (Array.isArray(item) && item.length >= 2) {
-      const [title, url] = item;
-      if (typeof url !== "string" || !url.startsWith("http")) continue;
-      pushSource(normalized, seen, {
-        url,
-        ...(typeof title === "string" && title.trim() ? { title: title.trim() } : {}),
-      });
-      continue;
-    }
-
-    if (isPlainObject(item)) {
-      const url = item.url || item.href || item.link;
-      if (typeof url !== "string" || !url.startsWith("http")) continue;
-      const title = item.title || item.name || item.label;
-      const description = item.description || item.snippet || item.content;
-      pushSource(normalized, seen, {
-        url,
-        ...(typeof title === "string" && title.trim() ? { title: title.trim() } : {}),
-        ...(typeof description === "string" && description.trim() ? { description: description.trim() } : {}),
-      });
-    }
-  }
-
-  return normalized;
-}
-
-function extractSourcesFromText(text) {
-  const sources = [];
-  const seen = new Set();
-
-  for (const match of String(text || "").matchAll(MD_LINK_PATTERN)) {
-    const title = match[1]?.trim();
-    const url = trimUrl(match[2]);
-    pushSource(sources, seen, {
-      url,
-      ...(title ? { title } : {}),
-    });
-  }
-
-  for (const url of extractUniqueUrls(text)) {
-    pushSource(sources, seen, { url });
-  }
-
-  return sources;
-}
-
-function pushSource(out, seen, source) {
-  const url = typeof source.url === "string" ? trimUrl(source.url.trim()) : "";
-  if (!url) return;
-  const key = normalizeSourceUrl(url);
-  if (seen.has(key)) return;
-  seen.add(key);
-  out.push({ ...source, url });
-}
-
-function isPlainObject(value) {
-  return value != null && typeof value === "object" && !Array.isArray(value);
+/** Normalize the allowed/excluded domain lists that search adapters push down. */
+export function domainFilters(filters) {
+  return {
+    allowed: Array.isArray(filters?.allowedDomains) ? filters.allowedDomains.filter(Boolean) : [],
+    excluded: Array.isArray(filters?.excludedDomains) ? filters.excludedDomains.filter(Boolean) : [],
+  };
 }

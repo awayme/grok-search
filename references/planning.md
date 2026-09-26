@@ -29,14 +29,23 @@ Skip planning when:
 5. Prefer primary or official sources when accuracy matters (vendor docs, standards bodies, release notes, official changelogs).
 6. If results conflict, fetch each primary page and surface the conflict to the user instead of silently picking a side.
 
+## Timeline Questions
+
+"Is it available now", "did they change the default", "does this still fail": the answer has a date, and sources from different dates are not in conflict, they are in sequence.
+
+- Search the recent window first (`--x-from-date` 60–90 days back for X; add the current month or version to web keywords). Widen only when the recent window is empty.
+- Use older material to explain how things got here, never to describe the present. An issue closed in March does not say what shipped in August.
+- When two sources disagree, write both with their dates and who said them (handle or organization), say which is newer, and leave the reconciliation visible to the user instead of picking one.
+- Tag each decisive quote with date, model or product version, client, and login method when those exist. A large share of apparent contradictions are two different setups.
+
 ## Source Hygiene
 
-- Treat `search.js --extra N` sources as leads, not citations. Grok did not necessarily read them; verify with `fetch.js` if accuracy matters.
+- Treat `search.js` extra sources (Tavily/Firecrawl) as leads, not citations. Grok did not read them; a card with `opened: true` was read, a plain `searched` card was only listed. Verify with `fetch.js` if accuracy matters.
 - Treat Direct Fetch output as best-effort text extraction, not a full browser render. Tables, scripts, and JS-rendered regions may be missing.
 - Treat Direct Map output as candidate URLs only, not a complete sitemap.
-- On every result, scan `warnings`, `tried`, `extra_tried`, `provider`, and `full_output_path` before deciding whether another command is needed.
+- On every result, scan `diagnostics.warnings`, `diagnostics.provider_attempts`, `diagnostics.provider`, and `content.full_path` / `answer.full_path` before deciding whether another command is needed.
 - If two sources disagree and both look authoritative, fetch each, quote the relevant lines, and report the conflict.
 
 ## Stop Conditions
 
-Stop as soon as the evidence answers the user. Every extra command should either reduce a specific uncertainty or supply a source the current result lacks. If you are about to run another command "just to be thorough" without a named gap to close, stop and answer.
+Stop as soon as the evidence answers the user. Every extra command should either reduce a specific uncertainty or supply a source the current result lacks. If you are about to run another command "just to be thorough" without a named gap to close, stop and answer. If two queries have already covered the same gap, a third phrasing will not close it: fetch the best URL you have or report the gap.

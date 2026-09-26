@@ -33,7 +33,7 @@ export const questions = [
     gold_urls: ["https://blog.rust-lang.org/2026/07/09/Rust-1.97.0/"],
     official_domains: ["rust-lang.org"],
     truth: truthSnapshot({ version: "1.97.0", date: "2026-07-09", changes: ["symbol mangling v0 default", "CARGO_BUILD_WARNINGS=deny"] }),
-    criteria: [asPattern("1\\.97\\.0"), asPattern("2026[-年/.]0?7[-月/.]0?9|July\\s+9,?\\s+2026"), asPattern("(symbol|符号).{0,45}(mangl|重整).{0,25}v0|mangl.{0,35}v0", "is"), asPattern("CARGO_BUILD_WARNINGS|cargo.{0,100}(deny|拒绝).{0,45}(warning|警告)", "is")],
+    criteria: [asPattern("1\\.97\\.0"), asPattern("2026[-年/.]0?7[-月/.]0?9|July\\s+9,?\\s+2026"), asPattern("(symbol|符号).{0,45}(mangl|重整|修饰).{0,25}v0|mangl.{0,35}v0", "is"), asPattern("CARGO_BUILD_WARNINGS|cargo.{0,100}(deny|拒绝).{0,45}(warning|警告)", "is")],
     stale_markers: [asPattern("1\\.96\\.[0-9]+")],
     verifier_answer: "Rust 最新稳定版为 1.97.0，发布于 2026-07-09；主要变化包括默认启用 symbol mangling v0，以及 Cargo 可用 CARGO_BUILD_WARNINGS=deny 拒绝警告。",
   },

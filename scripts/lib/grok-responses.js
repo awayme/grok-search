@@ -1,8 +1,9 @@
-import { authHeaders, requestJson } from "./providers.js";
+import { authHeaders, requestJson } from "./http.js";
+import { usesWebSearch, usesXSearch } from "./config.js";
 import { getLocalTimeContext, platformPrompt } from "./context.js";
-import { searchPrompt } from "./prompts.js";
-import { normalizeSourceUrl } from "./sources.js";
-import { usageDiagnostics } from "./usage.js";
+import { searchPrompt, xSearchPrompt } from "./prompts.js";
+import { isCitationMarker, isXUrl, normalizeSourceUrl, parseXPostUrl } from "./sources.js";
+import { numericField, usageDiagnostics } from "./usage.js";
 
 function asArray(value) {
   if (Array.isArray(value)) return value;
@@ -21,11 +22,37 @@ function responsesEndpoint(config) {
   return `${config.grokApiUrl.replace(/\/+$/, "")}/responses`;
 }
 
-function inputMessages(query, platform) {
-  return [
-    { role: "system", content: searchPrompt },
-    { role: "user", content: getLocalTimeContext() + query + platformPrompt(platform) },
-  ];
+/**
+ * The query doubles as the keywords Tavily/Firecrawl search for, so it should stay short.
+ * Anything the caller wants from Grok beyond "search this" (what to return, in which
+ * language, what not to do) travels here, appended to the user message so the system
+ * prompt prefix stays cacheable.
+ */
+function instructionsPrompt(instructions) {
+  const text = textField(instructions);
+  return text ? `\n\n# Instructions from the caller\n${text}\n` : "";
+}
+
+/**
+ * Without instructions the query is the last thing in the message and reads as the request.
+ * With instructions a short query sits between the time block and a "# Instructions" header
+ * and the model can take it for a stray context line ("No topic was specified", seen live
+ * 2026-09-08 with the query "Grok 4.6 coding agent"), so it gets a header of its own.
+ */
+function queryPrompt(query, instructions) {
+  return textField(instructions) ? `\n# Search query\n${query}` : query;
+}
+
+function inputMessages(query, options) {
+  const messages = [{ role: "system", content: searchPrompt }];
+  // Appended rather than merged so the base prompt remains a stable cache prefix.
+  if (usesXSearch(options.searchSource)) messages.push({ role: "system", content: xSearchPrompt });
+  messages.push({
+    role: "user",
+    content:
+      getLocalTimeContext() + queryPrompt(query, options.instructions) + platformPrompt(options.platform) + instructionsPrompt(options.instructions),
+  });
+  return messages;
 }
 
 function directWebSearchTool(options) {
@@ -37,26 +64,40 @@ function directWebSearchTool(options) {
   return tool;
 }
 
-function directXSearchTool(options) {
-  const tool = { type: "x_search" };
-  if (options.allowedXHandles.length) tool.allowed_x_handles = options.allowedXHandles;
-  if (options.excludedXHandles.length) tool.excluded_x_handles = options.excludedXHandles;
-  if (options.xFromDate) tool.from_date = options.xFromDate;
-  if (options.xToDate) tool.to_date = options.xToDate;
-  return tool;
+function xSearchFilters(options) {
+  const filters = {};
+  if (options.allowedXHandles.length) filters.allowed_x_handles = options.allowedXHandles;
+  if (options.excludedXHandles.length) filters.excluded_x_handles = options.excludedXHandles;
+  if (options.xFromDate) filters.from_date = options.xFromDate;
+  if (options.xToDate) filters.to_date = options.xToDate;
+  if (options.xImageUnderstanding) filters.enable_image_understanding = true;
+  if (options.xVideoUnderstanding) filters.enable_video_understanding = true;
+  return filters;
 }
 
 function buildDirectResponsesBody(query, options) {
-  const tools = [directWebSearchTool(options)];
-  if (options.includeXSearch) tools.push(directXSearchTool(options));
+  const tools = [];
+  if (usesWebSearch(options.searchSource)) tools.push(directWebSearchTool(options));
+  if (usesXSearch(options.searchSource)) tools.push({ type: "x_search", ...xSearchFilters(options) });
+  // Mounting no tool at all silently turns a search into a from-memory answer, so treat
+  // an unrecognized source as a programming error rather than shipping an empty request.
+  if (!tools.length) {
+    const error = new Error(`未知的 search source: ${JSON.stringify(options.searchSource)}`);
+    error.code = "SEARCH_SOURCE_INVALID";
+    throw error;
+  }
 
   const body = {
     model: options.model,
-    input: inputMessages(query, options.platform),
+    input: inputMessages(query, options),
     tools,
     max_turns: options.maxTurns,
     stream: false,
   };
+
+  // Only sent when the caller decided; relays that honor it cut X search calls sharply
+  // (12 -> 3 in the 2026-09-08 test), relays that do not echo it back unchanged.
+  if (typeof options.parallelToolCalls === "boolean") body.parallel_tool_calls = options.parallelToolCalls;
 
   const fixedReasoning420 = /^grok-4\.20(?!.*multi-agent)/i.test(options.model);
   if (options.reasoningEffort && !/non-reasoning/i.test(options.model) && !fixedReasoning420) {
@@ -80,17 +121,15 @@ function buildOpenRouterResponsesBody(query, options) {
 
   const body = {
     model: options.model,
-    input: inputMessages(query, options.platform),
+    input: inputMessages(query, options),
     tools: [{ type: "openrouter:web_search", parameters }],
     stream: false,
   };
 
-  if (options.includeXSearch) {
-    const xSearchFilter = {};
-    if (options.allowedXHandles.length) xSearchFilter.allowed_x_handles = options.allowedXHandles;
-    if (options.excludedXHandles.length) xSearchFilter.excluded_x_handles = options.excludedXHandles;
-    body.x_search_filter = xSearchFilter;
-  }
+  // OpenRouter attaches x_search to native search on its own for xAI models; the only
+  // control it exposes is this top-level filter, so "x"/"web" cannot be enforced here.
+  if (usesXSearch(options.searchSource)) body.x_search_filter = xSearchFilters(options);
+  if (typeof options.parallelToolCalls === "boolean") body.parallel_tool_calls = options.parallelToolCalls;
 
   return body;
 }
@@ -120,18 +159,31 @@ function outputTextFromContent(content) {
   return "";
 }
 
+const NARRATION_MAX_CHARS = 300;
+
 function extractResponsesText(data) {
   const directText = textField(data?.output_text);
   if (directText) return directText;
 
-  const texts = [];
+  const messages = [];
   for (const item of outputItems(data)) {
     if (item?.type && item.type !== "message" && !item.message && !item.content) continue;
+    const parts = [];
+    let annotations = 0;
     for (const content of contentItems(item)) {
       const text = outputTextFromContent(content);
-      if (text) texts.push(text);
+      if (text) parts.push(text);
+      annotations += Array.isArray(content?.annotations) ? content.annotations.length : 0;
     }
+    if (parts.length) messages.push({ text: parts.join("\n\n"), annotations });
   }
+
+  // Between tool calls the model narrates ("I'll search X for…", "Opening the changelog…"),
+  // and some relays return every such message. The answer is the last message; an earlier
+  // one is kept only when it is substantial or carries citations.
+  const texts = messages
+    .filter((message, index) => index === messages.length - 1 || message.annotations > 0 || message.text.length >= NARRATION_MAX_CHARS)
+    .map((message) => message.text);
 
   if (!texts.length && Array.isArray(data?.choices)) {
     for (const choice of data.choices) {
@@ -200,28 +252,72 @@ function snippetFromObject(value) {
   );
 }
 
+/**
+ * X citations arrive as a bare URL whose title is only the inline citation marker
+ * ("1", "2", ...). Recover the handle from the URL and drop the marker so the card
+ * carries attribution instead of a meaningless number.
+ */
+function xSourceFields(url, title) {
+  const post = parseXPostUrl(url);
+  if (!post) return null;
+  const isMarker = !title || isCitationMarker(title);
+  if (!isMarker) return { ...post, title };
+  return { ...post, ...(post.x_handle ? { title: `@${post.x_handle}` } : {}) };
+}
+
 function sourceFromValue(value, { sourceType, tool }) {
   const url = urlFromObject(value);
   if (!url) return null;
+  const normalizedUrl = normalizeSourceUrl(url);
+  // Some relays fill the citation title with the URL itself; that is no more a title than "1".
+  const rawTitle = titleFromObject(value);
+  const title = rawTitle && (rawTitle.trim() === url.trim() || rawTitle.trim() === normalizedUrl) ? "" : rawTitle;
+  const xFields = xSourceFields(normalizedUrl, title);
+
   return {
     provider: "grok-responses",
     source_type: sourceType,
     tool,
-    url: normalizeSourceUrl(url),
-    ...(titleFromObject(value) ? { title: titleFromObject(value) } : {}),
+    url: normalizedUrl,
+    // A marker ("1") is the footnote number, not a title. Keep it out of the card; the
+    // dedupe pass fills in a real title from the search listing when one exists.
+    ...(xFields ? xFields : usableTitle(title) ? { title } : {}),
     ...(snippetFromObject(value) ? { snippet: snippetFromObject(value) } : {}),
   };
 }
 
-function citationTool(value, defaultTool) {
-  const url = urlFromObject(value);
-  if (defaultTool === "web_search" && /^https?:\/\/(?:www\.)?(?:x\.com|twitter\.com)\//i.test(url)) {
-    return "x_search";
-  }
+function citationTool(value, defaultTool, xEnabled) {
+  // Citations are not tagged with the tool that produced them. When x_search is mounted
+  // an X link almost certainly came from it; when it is not, web search indexes x.com
+  // pages too, so claiming x_search there would report a search that never ran.
+  if (xEnabled && isXUrl(urlFromObject(value))) return "x_search";
   return defaultTool;
 }
 
+// Some relays pass xAI's x_search through as its underlying tools: custom_tool_call items
+// named x_keyword_search, x_semantic_search, x_thread_fetch, x_user_search, with the arguments
+// in a JSON string. They are x_search calls for counting and attribution.
+const X_CUSTOM_TOOL = /^x_[a-z_]+$/i;
+
+function customXToolName(item) {
+  const name = textField(item?.name);
+  return textField(item?.type) === "custom_tool_call" && X_CUSTOM_TOOL.test(name) ? name : "";
+}
+
+function customToolInput(item) {
+  const raw = item?.input ?? item?.arguments;
+  if (isPlainObject(raw)) return raw;
+  if (typeof raw !== "string" || !raw.trim()) return {};
+  try {
+    const parsed = JSON.parse(raw);
+    return isPlainObject(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
 function toolFromCall(item, defaultTool) {
+  if (customXToolName(item)) return "x_search";
   const raw = textField(item?.tool) || textField(item?.name) || textField(item?.type) || defaultTool;
   if (raw.endsWith("_call")) return raw.slice(0, -"_call".length);
   return raw;
@@ -242,6 +338,7 @@ function sourceArraysFromToolCall(item) {
 }
 
 function isSearchToolCall(item) {
+  if (customXToolName(item)) return true;
   const type = textField(item?.type);
   const name = textField(item?.name) || textField(item?.tool);
   return /search/i.test(type) || /search/i.test(name);
@@ -250,6 +347,8 @@ function isSearchToolCall(item) {
 function extractSearchedSources(data, defaultTool) {
   const sources = [];
   const toolCalls = [];
+  // URLs Grok actually opened (action.type "open_page"), keyed by normalized URL.
+  const openedUrls = new Map();
   let webSearchCalls = 0;
   let xSearchCalls = 0;
 
@@ -258,6 +357,18 @@ function extractSearchedSources(data, defaultTool) {
     const tool = toolFromCall(item, defaultTool);
     if (tool.includes("x_search")) xSearchCalls += 1;
     else if (tool.includes("web_search") || tool.includes("openrouter:web_search")) webSearchCalls += 1;
+
+    const customName = customXToolName(item);
+    const customInput = customName ? customToolInput(item) : {};
+    // x_keyword_search -> keyword_search, x_thread_fetch -> thread_fetch, so by_action reads
+    // like the web side (search / open_page / find_in_page).
+    const actionType = textField(item?.action?.type) || (customName ? customName.replace(/^x_/i, "") : "");
+    const actionUrl = textField(item?.action?.url) || textField(customInput.url);
+    const actionQuery = textField(item?.action?.query) || textField(customInput.query);
+    if (actionType === "open_page" && /^https?:\/\//i.test(actionUrl)) {
+      const key = normalizeSourceUrl(actionUrl);
+      if (!openedUrls.has(key)) openedUrls.set(key, tool);
+    }
 
     let sourceCount = 0;
     for (const sourceArray of sourceArraysFromToolCall(item)) {
@@ -273,31 +384,44 @@ function extractSearchedSources(data, defaultTool) {
       tool,
       ...(textField(item?.type) ? { type: textField(item.type) } : {}),
       ...(textField(item?.status) ? { status: textField(item.status) } : {}),
-      ...(textField(item?.action?.type) ? { action_type: textField(item.action.type) } : {}),
-      ...(textField(item?.action?.query) ? { query: textField(item.action.query) } : {}),
-      ...(textField(item?.action?.url) ? { url: textField(item.action.url) } : {}),
+      ...(actionType ? { action_type: actionType } : {}),
+      ...(actionQuery ? { query: actionQuery } : {}),
+      ...(actionUrl ? { url: actionUrl } : {}),
+      ...(textField(customInput.post_id) ? { post_id: textField(customInput.post_id) } : {}),
+      // Some relays attach the run's cumulative source list to every call item, so this is
+      // not "results of this query"; it is kept for raw-file consumers only.
       source_count: sourceCount,
     });
   }
 
-  return { sources, toolCalls, webSearchCalls, xSearchCalls };
+  return { sources, toolCalls, openedUrls, webSearchCalls, xSearchCalls };
 }
 
-function extractCitationSources(data, defaultTool) {
+function extractCitationSources(data, defaultTool, xEnabled) {
   const sources = [];
   for (const annotation of collectAnnotations(data)) {
-    const source = sourceFromValue(annotation, { sourceType: "citation", tool: citationTool(annotation, defaultTool) });
+    const tool = citationTool(annotation, defaultTool, xEnabled);
+    const source = sourceFromValue(annotation, { sourceType: "citation", tool });
     if (source) sources.push(source);
   }
 
   for (const citation of asArray(data?.citations)) {
-    const source = sourceFromValue(citation, { sourceType: "citation", tool: citationTool(citation, defaultTool) });
+    const tool = citationTool(citation, defaultTool, xEnabled);
+    const source = sourceFromValue(citation, { sourceType: "citation", tool });
     if (source) sources.push(source);
   }
 
   return sources;
 }
 
+function usableTitle(title) {
+  return Boolean(textField(title)) && !isCitationMarker(title);
+}
+
+/**
+ * One card per URL. The citation identity wins, but a marker title ("1") is a placeholder,
+ * not a title, so a real one from the search listing replaces it.
+ */
 function dedupeResponsesSources(citationSources, searchedSources) {
   const out = [];
   const indexByUrl = new Map();
@@ -313,35 +437,88 @@ function dedupeResponsesSources(citationSources, searchedSources) {
 
     const existing = out[existingIndex];
     if (existing.source_type !== "citation" && source.source_type === "citation") {
-      out[existingIndex] = { ...existing, ...source };
+      const title = usableTitle(source.title) ? source.title : existing.title;
+      out[existingIndex] = { ...existing, ...source, ...(title ? { title } : {}) };
       continue;
     }
 
-    if (!existing.title && source.title) existing.title = source.title;
+    if (!usableTitle(existing.title) && usableTitle(source.title)) existing.title = source.title;
     if (!existing.snippet && source.snippet) existing.snippet = source.snippet;
   }
 
   return out;
 }
 
-export function parseGrokResponses(data, { defaultTool = "web_search" } = {}) {
+/**
+ * "searched" only means a search listed the URL. Grok opening the page is a stronger signal,
+ * and the trace records it, so mark those cards and add opened pages the listings missed.
+ */
+function markOpenedSources(sources, openedUrls) {
+  const remaining = new Map(openedUrls);
+  for (const source of sources) {
+    const key = normalizeSourceUrl(source.url);
+    if (!remaining.has(key)) continue;
+    source.opened = true;
+    remaining.delete(key);
+  }
+  for (const [url, tool] of remaining) {
+    const source = sourceFromValue({ url }, { sourceType: "searched", tool });
+    if (source) sources.push({ ...source, opened: true });
+  }
+  return sources;
+}
+
+/**
+ * Billing-grade tool counts. Some relays bill server-side tool calls without emitting
+ * the matching `*_call` items in `output[]`, so `usage` carries counts the output array
+ * misses. Others do the reverse and report the field zeroed out, so take whichever
+ * source saw more calls per tool rather than letting either one alone win.
+ */
+function usageToolCounts(data) {
+  const details = data?.usage?.server_side_tool_usage_details;
+  if (!isPlainObject(details)) return null;
+  const webSearchCalls = numericField(details.web_search_calls);
+  const xSearchCalls = numericField(details.x_search_calls);
+  if (webSearchCalls == null && xSearchCalls == null) return null;
+  return { webSearchCalls: webSearchCalls ?? 0, xSearchCalls: xSearchCalls ?? 0 };
+}
+
+export function parseGrokResponses(data, { defaultTool = "web_search", xEnabled = false, requestedModel = "" } = {}) {
   const warnings = [];
   const text = extractResponsesText(data);
+  // Relays substitute models silently: one served grok-4.5-build for every grok-4.5 request
+  // (2026-09-08), at two to three times the tool calls and cost. Say so when it happens.
+  const servedModel = textField(data?.model);
+  if (requestedModel && servedModel && servedModel !== requestedModel) {
+    warnings.push(`Relay served model "${servedModel}" for requested "${requestedModel}".`);
+  }
   if (!text) warnings.push("Responses returned no output text.");
   if (!outputItems(data).length && !textField(data?.output_text)) warnings.push("Responses output array is missing or empty.");
 
-  const citationSources = extractCitationSources(data, defaultTool);
+  const citationSources = extractCitationSources(data, defaultTool, xEnabled);
   const searched = extractSearchedSources(data, defaultTool);
-  const sources = dedupeResponsesSources(citationSources, searched.sources);
+  const sources = markOpenedSources(dedupeResponsesSources(citationSources, searched.sources), searched.openedUrls);
+  const usageCounts = usageToolCounts(data);
+  const counts = {
+    webSearchCalls: Math.max(usageCounts?.webSearchCalls ?? 0, searched.webSearchCalls),
+    xSearchCalls: Math.max(usageCounts?.xSearchCalls ?? 0, searched.xSearchCalls),
+  };
 
   return {
     text,
     sources,
     diagnostics: {
       ...usageDiagnostics(data),
-      responses_web_search_calls: searched.webSearchCalls,
-      responses_x_search_calls: searched.xSearchCalls,
+      ...(servedModel ? { responses_model: servedModel } : {}),
+      responses_web_search_calls: counts.webSearchCalls,
+      responses_x_search_calls: counts.xSearchCalls,
       responses_tool_calls: searched.toolCalls,
+      responses_tool_call_total: counts.webSearchCalls + counts.xSearchCalls,
+      // Both raw tallies, so a consumer can see which side under-reported.
+      responses_tool_call_counts: {
+        upstream: usageCounts ? { web: usageCounts.webSearchCalls, x: usageCounts.xSearchCalls } : null,
+        trace: { web: searched.webSearchCalls, x: searched.xSearchCalls },
+      },
       warnings,
     },
   };
@@ -356,10 +533,14 @@ export async function searchGrokResponses(query, options, config) {
     timeoutMs: 180_000,
     config,
     retry: true,
+    retryOnTimeout: false,
   });
 
-  const defaultTool = config.apiProvider === "openrouter" ? "openrouter:web_search" : "web_search";
-  const parsed = parseGrokResponses(data, { defaultTool });
+  const defaultTool =
+    config.apiProvider === "openrouter" ? "openrouter:web_search" : options.searchSource === "x" ? "x_search" : "web_search";
+  // OpenRouter attaches x_search to native search for xAI models whatever we asked for.
+  const xEnabled = usesXSearch(options.searchSource) || config.apiProvider === "openrouter";
+  const parsed = parseGrokResponses(data, { defaultTool, xEnabled, requestedModel: options.model });
   if (!parsed.text.trim()) {
     const error = new Error("Grok Responses 返回空内容");
     error.code = "GROK_RESPONSES_EMPTY";

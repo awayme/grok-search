@@ -1,5 +1,7 @@
 # BlueOcean `grok-search` X Search 参数改造计划
 
+> 历史计划：本文记录 2026-07-31 基于 `2f6fee5` 的方案。后续 `main` 已采用 `--source web|x|both`、`--x-from-date` / `--x-to-date`，并支持 `--x-images` / `--x-videos`。当前行为以 README 和 `references/x-search.md` 为准。
+
 ## 1. 文档信息
 
 - 目标项目：`BlueOcean223/grok-search`

@@ -104,7 +104,7 @@ export function configureProxyFromEnv(env = process.env) {
   try {
     undici = require("undici");
   } catch (error) {
-    state = { mode: "error", error: `undici 未安装，无法启用代理: ${error.message}` };
+    state = { mode: "error", source: config.source, error: `undici 未安装，无法启用代理: ${error.message}` };
     debug(state.error);
     return state;
   }
@@ -143,7 +143,7 @@ export function configureProxyFromEnv(env = process.env) {
     );
     return state;
   } catch (error) {
-    state = { mode: "error", error: error.message };
+    state = { mode: "error", source: config.source, error: error.message };
     debug(`proxy setup failed: ${error.message}`);
     return state;
   }
@@ -151,4 +151,15 @@ export function configureProxyFromEnv(env = process.env) {
 
 export function getProxyState() {
   return state;
+}
+
+// Explicit GROK_PROXY expresses intent to route through a proxy; silently
+// falling back to a direct connection would defeat that intent, so fail
+// closed. Ambient HTTP_PROXY/HTTPS_PROXY failures stay non-fatal.
+export function assertProxyUsable() {
+  if (state.mode === "error" && state.source === "GROK_PROXY") {
+    const error = new Error(`GROK_PROXY 配置无效，已拒绝直连: ${state.error}`);
+    error.code = "PROXY_CONFIG_INVALID";
+    throw error;
+  }
 }

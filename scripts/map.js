@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 import { loadConfig } from "./lib/config.js";
-import { cleanupOutputDir, printJson } from "./lib/output.js";
-import { mapUrl } from "./lib/providers.js";
+import { startDeadline } from "./lib/deadline.js";
+import { cleanupOutputDir, printJson, runRecordBase, writeRunRecord, writeRunRecordSync } from "./lib/output.js";
+import { DIRECT_MAP_REQUEST_TIMEOUT_SECONDS, mapUrl } from "./lib/providers.js";
+import { assertProxyUsable } from "./lib/proxy.js";
 
 const DEFAULTS = {
   provider: "auto",
@@ -9,17 +11,24 @@ const DEFAULTS = {
   maxBreadth: 20,
   limit: 50,
   timeout: 150,
+  directTimeout: DIRECT_MAP_REQUEST_TIMEOUT_SECONDS,
   instructions: "",
 };
 
 function usage() {
-  return `Usage: ./scripts/map.js [--provider auto|tavily|direct] [--instructions TEXT] [--max-depth N] [--max-breadth N] [--limit N] [--timeout SECONDS] <url>
+  return `Usage: ./scripts/map.js [--provider auto|tavily|direct] [--instructions TEXT] [--max-depth N] [--max-breadth N] [--limit N] [--timeout SECONDS] [--direct-timeout SECONDS] [--deadline SECONDS] <url>
 
 Discover same-site URLs with Tavily Map or a lightweight Direct Map fallback.
+
+Timeouts:
+  --timeout SECONDS         Crawl budget handed to Tavily Map (default 150)
+  --direct-timeout SECONDS  Per-request timeout for Direct Map's sitemap and home page fetches (default 30)
 
 Environment:
   TAVILY_API_KEY       Optional Tavily Map key
   TAVILY_API_URL       Default: https://api.tavily.com
+  GROK_DEADLINE_SECONDS
+                       Optional whole-command deadline; default 240, 0 disables
 `;
 }
 
@@ -88,6 +97,22 @@ function parseArgs(argv) {
       out.timeout = parseIntOption("--timeout", arg.slice("--timeout=".length), { min: 1 });
       continue;
     }
+    if (arg === "--direct-timeout") {
+      out.directTimeout = parseIntOption("--direct-timeout", args.shift(), { min: 1 });
+      continue;
+    }
+    if (arg?.startsWith("--direct-timeout=")) {
+      out.directTimeout = parseIntOption("--direct-timeout", arg.slice("--direct-timeout=".length), { min: 1 });
+      continue;
+    }
+    if (arg === "--deadline") {
+      out.deadline = parseIntOption("--deadline", args.shift(), { min: 0 });
+      continue;
+    }
+    if (arg?.startsWith("--deadline=")) {
+      out.deadline = parseIntOption("--deadline", arg.slice("--deadline=".length), { min: 0 });
+      continue;
+    }
     if (arg?.startsWith("-")) throw new Error(`未知参数: ${arg}`);
     if (url) throw new Error(`只能提供一个 URL，多余参数: ${arg}`);
     url = arg;
@@ -125,6 +150,8 @@ function publicResult(args, result) {
       max_breadth: args.maxBreadth,
       limit: args.limit,
       timeout: args.timeout,
+      requestTimeout: args.directTimeout,
+      direct_timeout: args.directTimeout,
     },
     mapped_at: mappedAt,
   };
@@ -161,28 +188,67 @@ function errorOutput(error, code) {
   };
 }
 
+function runRecord(config, args, output) {
+  return {
+    ...runRecordBase("map", config, output.diagnostics.mapped_at),
+    url: args?.url ?? null,
+    base_url: output.base_url ?? null,
+    options: output.diagnostics.options ?? null,
+    provider: output.diagnostics.provider ?? null,
+    urls: output.urls ?? null,
+    provider_attempts: output.diagnostics.provider_attempts,
+    warnings: output.diagnostics.warnings,
+    diagnostics: output.diagnostics,
+    error: output.error ?? null,
+  };
+}
+
 let stage = "argument";
+let args = null;
+let config = null;
 try {
-  const args = parseArgs(process.argv.slice(2));
+  args = parseArgs(process.argv.slice(2));
   if (args.help) {
     console.log(usage());
     process.exit(0);
   }
 
   stage = "config";
-  const config = await loadConfig({ requireGrok: false });
+  config = await loadConfig({ requireGrok: false });
+  assertProxyUsable();
   await cleanupOutputDir(config);
   stage = "map";
-  const result = await mapUrl(args.url, config, args);
-  const output = publicResult(args, result);
-  printJson(output);
-  if (output.error) {
-    console.error(output.error.message);
-    process.exitCode = 1;
+  const deadlineSeconds = args.deadline ?? config.deadlineSeconds;
+  const stopDeadline = startDeadline(deadlineSeconds, () => {
+    const error = new Error(`映射总耗时超过 deadline（>${deadlineSeconds}s），已中止`);
+    const output = errorOutput(error, "DEADLINE_EXCEEDED");
+    const runPath = writeRunRecordSync(config, { kind: "map", label: args.url, record: runRecord(config, args, output) });
+    if (runPath) output.diagnostics.run_path = runPath;
+    printJson(output);
+    console.error(error.message);
+    process.exit(1);
+  });
+  try {
+    const result = await mapUrl(args.url, config, args);
+    const output = publicResult(args, result);
+    const runPath = await writeRunRecord(config, { kind: "map", label: args.url, record: runRecord(config, args, output) });
+    if (runPath) output.diagnostics.run_path = runPath;
+    printJson(output);
+    if (output.error) {
+      console.error(output.error.message);
+      process.exitCode = 1;
+    }
+  } finally {
+    stopDeadline();
   }
 } catch (error) {
   const code = error.code || (stage === "argument" ? "ARGUMENT_ERROR" : stage === "map" ? "MAP_ERROR" : "RUNTIME_ERROR");
-  printJson(errorOutput(error, code));
+  const output = errorOutput(error, code);
+  if (config) {
+    const runPath = await writeRunRecord(config, { kind: "map", label: args?.url || "error", record: runRecord(config, args, output) });
+    if (runPath) output.diagnostics.run_path = runPath;
+  }
+  printJson(output);
   console.error(error.message);
   process.exitCode = stage === "argument" ? 2 : 1;
 }
