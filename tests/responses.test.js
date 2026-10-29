@@ -415,6 +415,34 @@ const noUsageParsed = parseGrokResponses({
 });
 assert.deepEqual(noUsageParsed.diagnostics.responses_tool_call_counts, { upstream: null, trace: { web: 1, x: 0 } });
 
+// A failed call read nothing and usage leaves it out, so it does not count and does not mark
+// its URL opened. Seen live 2026-10-04: Grok guessed a xinhuanet URL, open_page failed, and
+// the card still ranked above the Tavily result that held the answer.
+const failedCallParsed = parseGrokResponses({
+  output: [
+    {
+      type: "web_search_call",
+      status: "completed",
+      action: { type: "search", query: "a", sources: [{ url: "https://www.gov.cn/listed", title: "Listed" }] },
+    },
+    { type: "web_search_call", status: "failed", action: { type: "open_page", url: "https://www.xinhuanet.com/guessed.htm" } },
+    { type: "web_search_call", status: "failed", action: { type: "open_page", url: "https://www.gov.cn/listed" } },
+    { type: "web_search_call", status: "failed", action: { type: "find_in_page", url: "https://www.gov.cn/listed", pattern: "x" } },
+    { type: "message", content: [{ type: "output_text", text: "Answer." }] },
+  ],
+  usage: { server_side_tool_usage_details: { web_search_calls: 1, x_search_calls: 0 } },
+});
+assert.equal(failedCallParsed.diagnostics.responses_web_search_calls, 1);
+assert.deepEqual(failedCallParsed.diagnostics.responses_tool_call_counts.trace, { web: 1, x: 0 });
+assert.deepEqual(
+  failedCallParsed.sources.map((source) => [source.url, source.opened === true]),
+  [["https://www.gov.cn/listed", false]]
+);
+assert.deepEqual(
+  failedCallParsed.diagnostics.responses_tool_calls.map((call) => call.status),
+  ["completed", "failed", "failed", "failed"]
+);
+
 // A marker title ("1") on the citation is a placeholder: the real title from the search
 // listing replaces it, and a page Grok opened is marked as such on the existing card.
 const markerParsed = parseGrokResponses({
@@ -520,6 +548,36 @@ assert.equal(twoPartParsed.text.startsWith("Part one."), true);
 assert.equal(twoPartParsed.text.endsWith("Part two."), true);
 const singleParsed = parseGrokResponses({ output: [{ type: "message", content: [{ type: "output_text", text: "Short only." }] }] });
 assert.equal(singleParsed.text, "Short only.");
+assert.equal(singleParsed.preamble, null);
+
+// Narration glued to the answer in one text part (grok-4.7, 2026-10-10) is cut at the answer
+// marker the prompt asks for, and kept aside. Links in it are not citations.
+const answerText = (text) => ({ output: [{ type: "message", content: [{ type: "output_text", text }] }] });
+assert.equal(buildResponsesBody("q", baseOptions, { apiProvider: "xai" }).input[0].content.includes("<!-- answer -->"), true);
+const markedParsed = parseGrokResponses(
+  answerText("我去查 [官方定价页](https://a.example/pricing)，核对价格。<!-- answer -->\n北京地域按量计费，见 [价格](https://a.example/p).")
+);
+assert.equal(markedParsed.text, "北京地域按量计费，见 [价格](https://a.example/p).");
+assert.equal(markedParsed.preamble, "我去查 [官方定价页](https://a.example/pricing)，核对价格。");
+assert.deepEqual(
+  markedParsed.sources.filter((source) => source.source_type === "citation").map((source) => source.url),
+  ["https://a.example/p"]
+);
+// A marker at the very start leaves an empty preamble; the last of several markers wins.
+assert.deepEqual(
+  (({ text, preamble }) => ({ text, preamble }))(parseGrokResponses(answerText("<!-- answer -->\nThe answer."))),
+  { text: "The answer.", preamble: "" }
+);
+assert.equal(parseGrokResponses(answerText("<!-- answer -->I'll look up the docs.<!-- answer -->\nThe answer.")).text, "The answer.");
+// A marker with nothing after it cuts nothing.
+assert.equal(parseGrokResponses(answerText("The answer.\n<!-- answer -->")).text, "The answer.");
+// Spacing and case may differ from the prompt's marker; it still cuts and does not stay in the text.
+assert.deepEqual(
+  (({ text, preamble }) => ({ text, preamble }))(parseGrokResponses(answerText("Checking the docs.<!--answer-->\nThe answer."))),
+  { text: "The answer.", preamble: "Checking the docs." }
+);
+assert.equal(parseGrokResponses(answerText("Narration.\n<!--  Answer  -->\nThe answer.")).text, "The answer.");
+assert.equal(parseGrokResponses(answerText("The answer.\n<!--ANSWER-->")).text, "The answer.");
 
 // The relay silently served another model: say so (micuapi returned grok-4.5-build for
 // every grok-4.5 request on 2026-09-08, at two to three times the tool calls).
@@ -559,9 +617,104 @@ assert.equal(Object.hasOwn(urlTitled.sources[0], "title"), false);
 assert.equal(urlTitled.sources[0].x_post_id, "2097015220749074540");
 assert.equal(Object.hasOwn(urlTitled.sources[1], "title"), false);
 
+// Without an inline citation, xAI lists every page its searches returned as zero-span
+// annotations titled with their own URL (api.x.ai and two relays, 2026-10-10). That listing
+// is not a citation; the links the answer writes are, in reading order. URLs in code are
+// endpoints the answer reports, and a "web:58" label only numbers the link.
+const listing = (url) => ({ type: "url_citation", url, start_index: 0, end_index: 0, title: url });
+const linkedParsed = parseGrokResponses({
+  output: [
+    {
+      type: "message",
+      content: [
+        {
+          type: "output_text",
+          text: [
+            "Prices are on [**Pay as You Go**](https://platform.minimax.io/docs/guides/pricing-paygo) and the CN page https://platform.minimax.cn/docs/guides/pricing-paygo。",
+            "The base URL is `https://api.minimax.io/anthropic`; see ([web:58](https://example.com/notes)) and [[1]](https://example.com/cited).",
+            "```\ncurl https://api.minimax.io/v1/models\n```",
+          ].join("\n\n"),
+          annotations: [
+            { type: "url_citation", url: "https://example.com/cited", start_index: 180, end_index: 210, title: "1" },
+            listing("https://example.com/listed"),
+            listing("https://platform.minimax.io/docs/guides/pricing-paygo"),
+          ],
+        },
+      ],
+    },
+  ],
+});
+assert.deepEqual(
+  linkedParsed.sources.map((source) => [source.source_type, source.url, source.title ?? null]),
+  [
+    ["citation", "https://example.com/cited", null],
+    ["citation", "https://platform.minimax.io/docs/guides/pricing-paygo", "Pay as You Go"],
+    ["citation", "https://platform.minimax.cn/docs/guides/pricing-paygo", null],
+    ["citation", "https://example.com/notes", null],
+    ["searched", "https://example.com/listed", null],
+  ]
+);
+
+// grok-4.6 sometimes stops at its first inline citation; the answer then carries no link and
+// only the listing. No card may claim to be cited, and a message whose only annotations are
+// the listing is still narration.
+const cutParsed = parseGrokResponses({
+  output: [
+    { type: "message", content: [{ type: "output_text", text: "Searching the docs.", annotations: [listing("https://a.example/1")] }] },
+    {
+      type: "message",
+      content: [
+        {
+          type: "output_text",
+          text: "An answer that stopped at its first citation.",
+          annotations: [listing("https://a.example/1"), listing("https://a.example/2")],
+        },
+      ],
+    },
+  ],
+});
+assert.equal(cutParsed.text, "An answer that stopped at its first citation.");
+assert.deepEqual(
+  cutParsed.sources.map((source) => [source.source_type, source.url]),
+  [
+    ["searched", "https://a.example/1"],
+    ["searched", "https://a.example/2"],
+  ]
+);
+
 const missing = parseGrokResponses({});
 assert.equal(missing.text, "");
 assert.equal(missing.sources.length, 0);
 assert.equal(missing.diagnostics.warnings.length >= 1, true);
 
 console.log("responses fixtures ok");
+
+// xAI's citation render markup leaked into two answers on record (2026-09-17, 10-08). It is
+// stripped; the text and links around it stay, and the links still count as citations.
+const leaked = parseGrokResponses({
+  output: [
+    {
+      type: "message",
+      content: [
+        {
+          type: "output_text",
+          text:
+            'Logs go to stdout ([Logging](https://devcenter.heroku.com/articles/logging)) show render_inline_citation with citation_id="2"\n\n' +
+            '| [@skim71](https://x.com/skim71) | Links the blog \ue200render_inline_citation speecheo_citation_id="19"\ue201 |\n' +
+            'None linked it. \ue200render_inline_citation speecheo_citation_id="13"\ue201 \ue200render_inline_citation speecheo_citation_id="15"\ue201',
+        },
+      ],
+    },
+  ],
+});
+assert.equal(
+  leaked.text,
+  "Logs go to stdout ([Logging](https://devcenter.heroku.com/articles/logging))\n\n| [@skim71](https://x.com/skim71) | Links the blog |\nNone linked it."
+);
+assert.deepEqual(
+  leaked.sources.map((source) => [source.url, source.source_type]),
+  [
+    ["https://devcenter.heroku.com/articles/logging", "citation"],
+    ["https://x.com/skim71", "citation"],
+  ]
+);

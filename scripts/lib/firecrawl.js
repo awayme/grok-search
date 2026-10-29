@@ -1,6 +1,5 @@
 import { recordFirecrawlCooldown } from "./cooldown.js";
-import { authHeaders, backoffMs, debugLog, isPlainObject, requestJson, sleep, upstreamMessage } from "./http.js";
-import { domainFilters } from "./sources.js";
+import { authHeaders, backoffMs, debugLog, isPlainObject, requestJson, sleep, trimBody, upstreamMessage } from "./http.js";
 
 export function firecrawlAuthMode(config) {
   return config?.firecrawlApiKey ? "api_key" : "keyless";
@@ -13,7 +12,7 @@ function firecrawlHeaders(config) {
 }
 
 /** Firecrawl signals an exhausted allowance with 402, or 429 plus `reason: "credits"`. */
-export function isFirecrawlQuotaError(error) {
+function isFirecrawlQuotaError(error) {
   return error?.status === 402 || error?.upstreamCode === "credits";
 }
 
@@ -54,6 +53,29 @@ export function firecrawlMetadata(data) {
   return out;
 }
 
+function withoutHash(value) {
+  try {
+    const url = new URL(value);
+    url.hash = "";
+    return url.toString();
+  } catch {
+    return value;
+  }
+}
+
+/**
+ * `metadata.url` is where Firecrawl's browser ended up; `sourceURL` is what was asked for.
+ * gov.cn answers a removed page with a 404 whose script jumps to the home page, and Firecrawl
+ * followed it and reported 200 for the home page (checked 2026-10-10), so the final URL is the
+ * only sign of what happened. Returns it when it differs from the requested URL.
+ */
+function redirectTarget(data, requestedUrl) {
+  const meta = data?.data?.metadata ?? data?.metadata;
+  const finalUrl = typeof meta?.url === "string" ? meta.url.trim() : "";
+  if (!/^https?:\/\//i.test(finalUrl)) return null;
+  return withoutHash(finalUrl) === withoutHash(requestedUrl) ? null : finalUrl;
+}
+
 /**
  * Retry policy has two layers. HTTP-level failures (5xx, transient 429, timeouts) belong to
  * `requestJson`, which also knows when a Retry-After is too far away to bother. The loop here
@@ -64,7 +86,6 @@ export function firecrawlMetadata(data) {
 export async function firecrawlScrape(url, config, { timeoutMs = 90_000 } = {}) {
   const endpoint = `${config.firecrawlApiUrl.replace(/\/+$/, "")}/scrape`;
   const authMode = firecrawlAuthMode(config);
-  const startedAt = Date.now();
   const stats = { requests: 0 };
   const fail = (error, extra = {}) => ({
     ok: false,
@@ -72,7 +93,6 @@ export async function firecrawlScrape(url, config, { timeoutMs = 90_000 } = {}) 
     auth_mode: authMode,
     error,
     requests: stats.requests,
-    duration_ms: Date.now() - startedAt,
     ...extra,
   });
 
@@ -108,7 +128,22 @@ export async function firecrawlScrape(url, config, { timeoutMs = 90_000 } = {}) 
     }
 
     const content = data?.data?.markdown || data?.markdown || "";
+    const metadata = firecrawlMetadata(data);
+    const credits = Number.isFinite(data?.data?.metadata?.creditsUsed) ? { credits_used: data.data.metadata.creditsUsed } : {};
+    // Firecrawl returns the markdown of whatever the target served, with the target's status
+    // beside it. All seven pages it returned with a status of 400 or more (2026-09-15 to
+    // 10-06) were error pages, such as "Page Not Found" or Google's "503. That's an error.",
+    // so such a page hands over to the next provider like any other failure. Checked before
+    // the empty-markdown retry: a longer waitFor does not revive a 404.
+    if (Number(metadata.status) >= 400) {
+      return fail(`target page returned HTTP ${metadata.status}`, {
+        metadata,
+        ...(content.trim() ? { error_preview: trimBody(content.trim(), 300) } : {}),
+        ...credits,
+      });
+    }
     if (content.trim()) {
+      const finalUrl = redirectTarget(data, url);
       return {
         ok: true,
         provider: "firecrawl",
@@ -117,9 +152,9 @@ export async function firecrawlScrape(url, config, { timeoutMs = 90_000 } = {}) 
         raw: data,
         attempts: attempt + 1,
         requests: stats.requests,
-        duration_ms: Date.now() - startedAt,
-        metadata: firecrawlMetadata(data),
-        ...(Number.isFinite(data?.data?.metadata?.creditsUsed) ? { credits_used: data.data.metadata.creditsUsed } : {}),
+        metadata,
+        ...(finalUrl ? { final_url: finalUrl, redirected: true } : {}),
+        ...credits,
       };
     }
 
@@ -128,66 +163,4 @@ export async function firecrawlScrape(url, config, { timeoutMs = 90_000 } = {}) 
   }
 
   return fail("Firecrawl Scrape 返回空内容");
-}
-
-function sourceFromFirecrawl(result) {
-  const url = typeof result?.url === "string" ? result.url.trim() : "";
-  if (!url) return null;
-  return {
-    url,
-    provider: "firecrawl",
-    ...(result.title ? { title: String(result.title).trim() } : {}),
-    ...(result.description ? { description: String(result.description).trim() } : {}),
-  };
-}
-
-export async function firecrawlSearch(query, limit, config, filters = {}) {
-  const endpoint = `${config.firecrawlApiUrl.replace(/\/+$/, "")}/search`;
-  const authMode = firecrawlAuthMode(config);
-  const { allowed, excluded } = domainFilters(filters);
-  try {
-    const data = await requestJson(endpoint, {
-      headers: firecrawlHeaders(config),
-      body: {
-        query,
-        limit,
-        // Firecrawl v2 search: includeDomains / excludeDomains are hostnames and mutually
-        // exclusive, which resolveFilterPair already guarantees upstream.
-        ...(allowed.length ? { includeDomains: allowed } : {}),
-        ...(excluded.length ? { excludeDomains: excluded } : {}),
-      },
-      timeoutMs: 90_000,
-      config,
-      retry: true,
-    });
-    const rawResults = Array.isArray(data?.data?.web)
-      ? data.data.web
-      : Array.isArray(data?.data)
-        ? data.data
-        : Array.isArray(data?.web)
-          ? data.web
-          : [];
-    const sources = rawResults.map(sourceFromFirecrawl).filter(Boolean);
-    return {
-      ok: true,
-      provider: "firecrawl",
-      auth_mode: authMode,
-      sources,
-      raw: data,
-      ...(Number.isFinite(data?.creditsUsed) ? { credits_used: data.creditsUsed } : {}),
-    };
-  } catch (error) {
-    const quota = isFirecrawlQuotaError(error);
-    if (quota) {
-      await recordFirecrawlCooldown(config, { authMode, retryAfterMs: error.retryAfterMs, reason: error.upstreamCode || "quota" });
-    }
-    return {
-      ok: false,
-      provider: "firecrawl",
-      auth_mode: authMode,
-      error: error.message,
-      sources: [],
-      ...(quota ? { quota_exhausted: true } : {}),
-    };
-  }
 }

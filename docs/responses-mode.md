@@ -3,7 +3,7 @@
 `search.js` 的唯一生产搜索协议是 Responses API：
 
 ```bash
-./scripts/search.js "query"
+node scripts/search.js "query"
 ```
 
 它不支持 Chat Completions，也没有模式切换或 Chat fallback。
@@ -54,11 +54,13 @@
 | `both` | `web_search` + `x_search` | 由 Grok 自行路由 |
 
 ```bash
-./scripts/search.js --source x "X 上怎么评价 grok-4.6"
-./scripts/search.js --source both "grok-4.6 发布后的反响"
-./scripts/search.js --source x --responses-allowed-x-handles xai,elonmusk "query"
-./scripts/search.js --source x --x-from-date 2026-08-01 --x-to-date 2026-08-16 "query"
+node scripts/search.js --source x "X 上怎么评价 grok-4.6"
+node scripts/search.js --source both "grok-4.6 发布后的反响"
+node scripts/search.js --source x --responses-allowed-x-handles xai,elonmusk "query"
+node scripts/search.js --source x --x-from-date 2026-08-01 --x-to-date 2026-08-16 "query"
 ```
+
+日期窗口或 handle 过滤下一条帖子都没读到（`x_posts_fetched` 为 0）时，`diagnostics.warnings` 会点名过滤条件并建议放宽：2026-10-11 用 `--x-from-date 2026-09-01` 查 @nodejs 返回空，其实是该账号最后一帖在 08-27，三家 provider 去掉日期都能搜到。
 
 `x_search` 的过滤参数放在 tool 对象上（不是 `filters`）：
 
@@ -110,7 +112,7 @@ auto | native | exa | firecrawl | parallel | perplexity
 ```
 
 ```bash
-./scripts/search.js --responses-openrouter-engine exa "query"
+node scripts/search.js --responses-openrouter-engine exa "query"
 ```
 
 模型名不会自动追加 `:online`。
@@ -153,7 +155,8 @@ OpenRouter 对 xAI 模型会**自动**把 `x_search` 挂在 native web search �
 
 解析器收集：
 
-- output text annotations 与 top-level citations；
+- output text annotations 与 top-level citations；起止位置都为 0、标题为空或等于 URL 的 annotation 是检索结果清单，记为 `searched`；
+- 最终回答正文里的 Markdown 链接和裸 URL（跳过代码块和行内代码），按出现顺序记为 `citation`；
 - `web_search_call`、`x_search_call` 的 action/query/url/source；
 - usage 与费用字段。
 
@@ -184,31 +187,22 @@ X citation 只带裸 URL，且 `title` 就是 inline citation 序号（`"1"`、`
 }
 ```
 
-只有 `/<handle>/status/<id>` 这种形式带署名；`https://x.com/i/status/...`、`https://x.com/i/web/status/...` 只填 `x_post_id`，并且不保留序号标题。
+只有 `/<handle>/status/<id>` 这种形式带署名；`https://x.com/i/status/...`、`https://x.com/i/web/status/...` 只填 `x_post_id`，并且不保留序号标题。xAI 的 X search 常以 `/i/status/<id>` 引用（记录里 grok-4.6 的 186 张 X search 卡片有 120 张是这种），答案正文若用 `/<handle>/status/<id>` 链接了同一条帖子，两者按帖子 id 合并，卡片得到 handle；记录里这样补上的只有 3 张，其余的 handle 只在 `answer.text` 里。
 
 citation 本身不带产出工具信息，所以 `tool` 是推断的：**挂了 `x_search` 时**（`--source x` / `both`，以及 OpenRouter——那里 `x_search` 必然随行）X 链接标为 `x_search`；`--source web` 下不标，因为 web search 本来就会索引 x.com 页面，标成 `x_search` 等于报告一次没发生的检索。URL 还原出的 `x_handle` / `x_post_id` 与挂了哪个工具无关，始终保留。
 
-## Tavily 与 Firecrawl
+## 不再有 Tavily 与 Firecrawl
 
-它们与 Responses 请求并行，但不进入 `input`：
-
-```text
-Grok Responses ──────────────┐
-Tavily Search（有 key）───────┼─ sources.items（去重合并 + 上限裁剪）
-Firecrawl Search（Keyless/key）┘
-```
-
-默认合计 6 条；两家可用时 3/3。Firecrawl provider attempt 会包含 `auth_mode`、`requests`、`duration_ms`，可能包含 `credits_used`；冷却期内为 `skipped: true`。域名过滤会下推给两家，域外结果在排序时降到最后并计入 `off_domain`。`--instructions` 不会传给两家。
+2026-10-19 之前，Tavily Search 与 Firecrawl Search 与 Responses 请求并行，结果去重合并进 `sources.items`，Grok 额度耗尽时降级为它们的原始结果。真实会话里极少用到，于是删掉（数据见 `.agent/extras-review-2026-10-19.md`）。`sources.items` 现在只有 Grok 的来源。
 
 ## 额度错误
 
-只有明确额度信号触发 degraded success：
+Grok 失败一律报错，额度与限流各有错误码：
 
-- HTTP 402；
-- HTTP 429 且正文包含 quota、credit、balance、billing、额度、余额等信号；
-- `insufficient_quota`、`credits_exhausted` 等错误码。
+- HTTP 402；HTTP 429 且正文包含 quota、credit、balance、billing、额度、余额等信号；`insufficient_quota`、`credits_exhausted` 等错误码：`GROK_QUOTA_EXHAUSTED`，`diagnostics.grok_error.code` 为 `QUOTA_EXHAUSTED`。
+- 重试后仍然是不带额度信号的 429：`GROK_RATE_LIMITED`，`grok_error.code` 为 `RATE_LIMITED`。
 
-不带额度信号的 429 归为 `RATE_LIMITED`，降级行为相同但 `grok_error.code` 与 warning 文案如实区分。降级输出同时包含人类可见警告和结构化 `diagnostics.grok_error`。`--no-extra` 时返回 `GROK_QUOTA_EXHAUSTED` / `GROK_RATE_LIMITED`。401/403、404/422、5xx、超时和空响应仍是普通错误。
+401/403、404/422、5xx、超时和空响应保留上游信息。
 
 ## Diagnostics
 
@@ -222,12 +216,12 @@ Firecrawl Search（Keyless/key）┘
 - `diagnostics.options.x_from_date` / `diagnostics.options.x_to_date`（启用 X 且设置日期时）
 - `responses_tool_calls`
 
-工具调用次数取 `usage.server_side_tool_usage_details`（计费口径）与 `output[]` 里 `*_call` item 统计的**逐工具较大值**。两边都不可单独信任：部分中转会计费 `x_search` 却不吐 `x_search_call` item（只看 `output[]` 会报 0），另一些会把该字段填成全 0（只看 usage 同样报 0）。`responses_tool_calls` 摘要为 `{ total, upstream: { web, x } | null, trace: { web, x }, by_action: { search, open_page, find_in_page }, failed? }`：`total` 用较大值口径，`upstream` / `trace` 保留两侧原始计数，因此 `total` 可能大于 `raw_path` 里记录的 tool call 明细条数。
-- `search_budget`：`{ prompt_total: 6, prompt_x: 0|4, used_web, used_x, used_total, exceeded, enforced: false }`。prompt 里的预算是给模型的建议，不是上限：`max_turns` 限的是 agentic turn，一个 turn 可含多次检索，而且它只对 X 搜索是硬上限、web 搜索不受它约束，所以 `enforced` 恒为 false。请求侧能压次数的只有 `parallel_tool_calls: false`（`--responses-parallel-tool-calls false`，默认不发）：官方与透传的中转上每 turn 一次调用，但只在 `responses_tool_calls.total` 常超 6 时才省钱，grok-4.6 自然只跑 3–5 次、加了不省。`max_tool_calls` 官方与中转都不生效，未接入。模型本身是最大的费用杠杆（同题 grok-4.6 的调用是 grok-4.5 的 1/3–1/4）。`cost_usd` 是端点报的 `usage.cost_in_usd_ticks`，中转与官方对同一 usage 报的数可差一倍多，跨供应商不可比。实验过程与数据见 `.agent/tool-call-cap-2026-09-08.md`。
+工具调用次数取 `usage.server_side_tool_usage_details`（计费口径）与 `output[]` 里 `*_call` item 统计的**逐工具较大值**。两边都不可单独信任：部分中转会计费 `x_search` 却不吐 `x_search_call` item（只看 `output[]` 会报 0），另一些会把该字段填成全 0（只看 usage 同样报 0）。`responses_tool_calls` 摘要为 `{ total, upstream: { web, x } | null, trace: { web, x }, by_action: { search, open_page, find_in_page }, failed? }`：`total` 用较大值口径，`upstream` / `trace` 保留两侧原始计数，因此 `total` 可能大于 `raw_path` 里记录的 tool call 明细条数。`status` 不是 `completed` 的调用（例如对打不开或 Grok 猜出来的 URL 做 `open_page`）只列在 `failed`：usage 不计费，`trace`、`by_action`、`total` 也都不算它，它的 URL 不标 `opened`。
+- `search_budget`：`{ prompt_total: 6, prompt_x: 0|4, used_web, used_x, used_total, used_searches, used_x_searches, exceeded, enforced: false }`。`used_web` / `used_x` / `used_total` 是计费调用数（含 open_page / find_in_page），`used_searches` / `used_x_searches` 只数检索（trace 里看不到的计费调用按检索算），`exceeded` 按后两者判断。prompt 里的预算是给模型的建议，不是上限：`max_turns` 限的是 agentic turn，一个 turn 可含多次检索，而且它只对 X 搜索是硬上限、web 搜索不受它约束，所以 `enforced` 恒为 false。请求侧能压次数的只有 `parallel_tool_calls: false`（`--responses-parallel-tool-calls false`，默认不发）：官方与透传的中转上每 turn 一次调用，但只在 `responses_tool_calls.total` 常超 6 时才省钱，grok-4.6 自然只跑 3–5 次、加了不省。`max_tool_calls` 官方与中转都不生效，未接入。模型本身是最大的费用杠杆（同题 grok-4.6 的调用是 grok-4.5 的 1/3–1/4）。`cost_usd` 是端点报的 `usage.cost_in_usd_ticks`，中转与官方对同一 usage 报的数可差一倍多，跨供应商不可比。实验过程与数据见 `.agent/tool-call-cap-2026-09-08.md`。
 - `responses_model`：中转实际返回的 `model`；与请求不同时写 warning。第一个中转对每次 `grok-4.5` 请求都返回 `grok-4.5-build`，这才是它 2–3 倍调用次数的来源
-- 中转差异还包括：X 搜索以 `custom_tool_call`（`x_keyword_search` / `x_thread_fetch` …）形式返回，解析器按 `x_search` 计数并把 `by_action` 写成 `keyword_search` / `thread_fetch`；每个 turn 的过场 message（"I'll search X…"）被丢弃，`answer.text` 只取最后一条，除非前面的 message 很长或带 citation
+- grok-4.6 的回答截断：模型写到第一个行内引用就停止输出，`status` 仍是 `completed`、没有 `incomplete_details`，回答只剩开头一两段、没有链接，随后附上起止位置为 0 的检索结果清单。2026-10-10 在官方 `api.x.ai` 和两家中转上都复现，历史 run record 里约六分之一的 web 搜索中招；同一批问题 grok-4.7 跑 15 次没有出现。解析器无法补回缺失内容，也不自动重试（grok-4.7 不用行内引用时也会给出完整但没有链接的回答，按"无链接"判断截断会误报）
+- 中转差异还包括：X 搜索以 `custom_tool_call`（`x_keyword_search` / `x_thread_fetch` …）形式返回，解析器按 `x_search` 计数并把 `by_action` 写成 `keyword_search` / `thread_fetch`；每个 turn 的过场 message（"I'll search X…"）被丢弃，`answer.text` 只取最后一条，除非前面的 message 很长或带 citation。grok-4.6、grok-4.7 经中转时过场话和答案拼在同一段文本里，这时按 system prompt 要求的答案标记行 `<!-- answer -->` 切开（空格和大小写不同也认），标记前的文字写进运行记录的 `answer_preamble`；模型没写标记就保留全文
+- xAI 的引用渲染标记偶尔漏进正文：私用区字符包着的 `\ue200render_inline_citation speecheo_citation_id="10"\ue201`（grok-4.6，2026-10-08），或链接后裸露的 `show render_inline_citation with citation_id="2"`（grok-4.6-build，2026-09-17）。解析器删掉这两种标记，周围的正文和链接不动
 - `options.instructions_chars`（传了 `--instructions` 时）
-- `extra_allocation`
-- `firecrawl_auth_mode`
-- `degraded` / `grok_error`
+- `grok_error`（报额度或限流错误时）
 - `usage` / `cost_usd`

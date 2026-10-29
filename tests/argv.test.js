@@ -2,18 +2,20 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
 const testHome = await mkdtemp(path.join(tmpdir(), "grok-search-test-home-"));
-// Provider cooldowns persist across commands; give the suite its own state dir so one
-// fixture's quota failure cannot leak into the next.
-const testState = await mkdtemp(path.join(tmpdir(), "grok-search-test-state-"));
 
 async function runNode(args, env = {}) {
+  // Provider cooldowns and the fetch cache persist across commands. Each command gets its own
+  // state dir, so one fixture's quota failure or cached page (a reused port serves another
+  // fixture's URL) cannot leak into the next; a test that needs state passes GROK_STATE_DIR.
+  // The command's own dir is removed afterwards.
+  const stateDir = env.GROK_STATE_DIR ? null : await mkdtemp(path.join(tmpdir(), "grok-search-test-state-"));
   try {
     const result = await execFileAsync("node", args, {
       cwd: process.cwd(),
@@ -21,7 +23,7 @@ async function runNode(args, env = {}) {
         ...process.env,
         HOME: testHome,
         USERPROFILE: testHome,
-        GROK_STATE_DIR: testState,
+        ...(stateDir ? { GROK_STATE_DIR: stateDir } : {}),
         TAVILY_API_KEY: "",
         FIRECRAWL_API_KEY: "",
         TAVILY_API_URL: "",
@@ -42,6 +44,8 @@ async function runNode(args, env = {}) {
     return { code: 0, stdout: result.stdout, stderr: result.stderr };
   } catch (error) {
     return { code: error.code, stdout: error.stdout || "", stderr: error.stderr || "" };
+  } finally {
+    if (stateDir) await rm(stateDir, { recursive: true, force: true });
   }
 }
 
@@ -117,7 +121,7 @@ result = await runNode(["scripts/search.js"], { GROK_API_KEY: "secret-search-key
 assert.equal(result.code, 2);
 assertCommandErrorSchema(parseJson(result.stdout), "searched_at", "ARGUMENT_ERROR");
 
-for (const removed of ["--search-mode", "--fallback-chat", "--ground-extra"]) {
+for (const removed of ["--search-mode", "--fallback-chat", "--ground-extra", "--extra", "--no-extra"]) {
   result = await runNode(["scripts/search.js", removed, "mock query"]);
   assert.equal(result.code, 2);
   assert.match(result.stderr, /未知参数/);
@@ -160,7 +164,6 @@ await withServer(
     let searchResult = await runNode(
       [
         "scripts/search.js",
-        "--no-extra",
         "--responses-x-from-date",
         "2026-07-01",
         "--responses-x-to-date",
@@ -177,7 +180,7 @@ await withServer(
 
     expectedDateXTool = { type: "x_search", to_date: "2026-08-31" };
     searchResult = await runNode(
-      ["scripts/search.js", "--no-extra", "--responses-x-to-date=2026-08-31", "mock query"],
+      ["scripts/search.js", "--responses-x-to-date=2026-08-31", "mock query"],
       baseGrokEnv(port)
     );
     assert.equal(searchResult.code, 0);
@@ -187,7 +190,7 @@ await withServer(
 
     expectedDateXTool = { type: "x_search", from_date: "2026-09-01" };
     searchResult = await runNode(
-      ["scripts/search.js", "--no-extra", "mock query"],
+      ["scripts/search.js", "mock query"],
       baseGrokEnv(port, { GROK_RESPONSES_X_FROM_DATE: "2026-09-01", GROK_SEARCH_SOURCE: "both" })
     );
     assert.equal(searchResult.code, 0);
@@ -196,7 +199,7 @@ await withServer(
 
     expectedDateXTool = { type: "x_search", from_date: "2026-09-02" };
     searchResult = await runNode(
-      ["scripts/search.js", "--no-extra", "--responses-x-from-date=2026-09-02", "mock query"],
+      ["scripts/search.js", "--responses-x-from-date=2026-09-02", "mock query"],
       baseGrokEnv(port, { GROK_RESPONSES_X_FROM_DATE: "2026-09-01" })
     );
     assert.equal(searchResult.code, 0);
@@ -236,7 +239,7 @@ await withServer(
       })
     );
     const searchResult = await runNode(
-      ["scripts/search.js", "--no-extra", "--responses-x-from-date=2026-06-15", "mock query"],
+      ["scripts/search.js", "--responses-x-from-date=2026-06-15", "mock query"],
       {
         HOME: configHome,
         USERPROFILE: configHome,
@@ -268,7 +271,7 @@ await withServer(
   async (_server, port) => {
     const handles = ["@User0", "user0", "USER0", ...Array.from({ length: 19 }, (_item, index) => `User${index + 1}`)];
     const searchResult = await runNode(
-      ["scripts/search.js", "--no-extra", "--responses-allowed-x-handles", handles.join(","), "mock query"],
+      ["scripts/search.js", "--responses-allowed-x-handles", handles.join(","), "mock query"],
       baseGrokEnv(port)
     );
     assert.equal(searchResult.code, 0);
@@ -343,7 +346,7 @@ await withServer(
     });
     for (const testCase of cases) {
       const searchResult = await runNode(
-        ["scripts/search.js", "--no-extra", ...testCase.args, "mock query"],
+        ["scripts/search.js", ...testCase.args, "mock query"],
         baseGrokEnv(port, testCase.env)
       );
       assert.equal(searchResult.code, testCase.exitCode || 1);
@@ -366,8 +369,19 @@ await withServer(
     assert.equal(defaultFetch.code, 0);
     let output = parseJson(defaultFetch.stdout);
     assert.equal(output.content.chars, 12_000);
+    assert.equal(output.content.offset, 0);
     assert.equal(output.content.truncated, true);
     assert.equal((await readFile(output.content.full_path, "utf8")).length, 13_000);
+    // The cut is said inside the text, for agents that print only content.text.
+    assert.equal(
+      output.content.text,
+      `${"z".repeat(12_000)}\n\n[grok-search] Showing characters 0–12000 of 13000. For the rest, rerun with --offset 12000 (cached for 15 minutes) or read ${output.content.full_path}.`
+    );
+    assert.equal(typeof output.diagnostics.duration_ms, "number");
+    // The run record keeps the full text and says what stdout carried of it.
+    const record = JSON.parse(await readFile(output.diagnostics.run_path, "utf8"));
+    assert.equal(record.content.length, 13_000);
+    assert.deepEqual(record.printed_content, { offset: 0, chars: 12_000, truncated: true, full_path: output.content.full_path });
 
     const explicitFetch = await runNode([
       "scripts/fetch.js",
@@ -380,8 +394,105 @@ await withServer(
     output = parseJson(explicitFetch.stdout);
     assert.equal(output.content.original_chars, 13_000);
     assert.equal(output.content.truncated, false);
+    assert.equal(output.content.text, "z".repeat(13_000));
   }
 );
+
+// Fetching a URL again within 15 minutes reads the cache: --offset continues a cut page and a
+// different filter of the same page costs no request. Failures are not cached; --no-cache and
+// a different provider choice go out again.
+{
+  const cacheState = await mkdtemp(path.join(tmpdir(), "grok-search-cache-state-"));
+  let requests = 0;
+  let failNext = false;
+  await withServer(
+    (req, res) => {
+      req.resume();
+      requests += 1;
+      if (failNext) {
+        failNext = false;
+        res.writeHead(503, { "content-type": "text/plain" });
+        res.end("busy");
+        return;
+      }
+      res.writeHead(200, { "content-type": "text/plain" });
+      res.end(`${"a".repeat(5000)}${"b".repeat(5000)}${"c".repeat(5000)}\n`);
+    },
+    async (_server, port) => {
+      const url = `http://127.0.0.1:${port}/page.txt`;
+      const fetchJson = async (...args) =>
+        parseJson((await runNode(["scripts/fetch.js", ...args, url], { GROK_STATE_DIR: cacheState })).stdout);
+
+      let output = await fetchJson("--provider", "direct", "--max-chars", "5000");
+      assert.equal(requests, 1);
+      assert.equal(Object.hasOwn(output.diagnostics, "cache"), false);
+      assert.match(output.content.text, /rerun with --offset 5000 \(cached for 15 minutes\)/);
+      // Non-HTML comes back as served, final newline included.
+      assert.equal((await readFile(output.content.full_path, "utf8")).length, 15_001);
+      const firstFullPath = output.content.full_path;
+
+      output = await fetchJson("--provider", "direct", "--max-chars", "5000", "--offset", "5000");
+      assert.equal(requests, 1);
+      assert.equal(output.diagnostics.cache.hit, true);
+      assert.equal(typeof output.diagnostics.cache.fetched_at, "string");
+      assert.deepEqual(output.diagnostics.provider_attempts, []);
+      assert.equal(output.diagnostics.provider, "direct");
+      assert.equal(output.content.offset, 5000);
+      assert.ok(output.content.text.startsWith("b".repeat(5000)));
+      assert.match(output.content.text, /Showing characters 5000–10000 of 15001\. For the rest, rerun with --offset 10000 /);
+      const record = JSON.parse(await readFile(output.diagnostics.run_path, "utf8"));
+      assert.equal(record.diagnostics.cache.hit, true);
+      assert.equal(record.printed_content.offset, 5000);
+      // The continuation points at the file the first run wrote instead of writing the text again.
+      assert.equal(output.content.full_path, firstFullPath);
+
+      // The last part: nothing left to point at.
+      output = await fetchJson("--provider", "direct", "--offset", "10000");
+      assert.equal(requests, 1);
+      assert.equal(output.content.text, `${"c".repeat(5000)}\n`);
+      assert.equal(output.content.truncated, true);
+
+      output = await fetchJson("--provider", "direct", "--offset", "99999");
+      assert.equal(output.content.text, "[grok-search] --offset 99999 is past the end of the text, which has 15001 characters.");
+      assert.match(output.diagnostics.warnings.join("\n"), /past the end/);
+
+      // The hint names how long the cached copy has left, not the full lifetime.
+      const cacheDir = path.join(cacheState, "fetch-cache");
+      const [cacheFile] = await readdir(cacheDir);
+      const cachedRecord = JSON.parse(await readFile(path.join(cacheDir, cacheFile), "utf8"));
+      for (const entry of cachedRecord.entries) entry.cached_at = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+      await writeFile(path.join(cacheDir, cacheFile), JSON.stringify(cachedRecord));
+      output = await fetchJson("--provider", "direct", "--max-chars", "5000", "--offset", "5000");
+      assert.equal(requests, 1);
+      assert.match(output.content.text, /rerun with --offset 10000 \(cached for 5 minutes\)/);
+
+      // --offset on a new fetch says the offset may not line up with an earlier copy.
+      output = await fetchJson("--provider", "direct", "--no-cache", "--max-chars", "5000", "--offset", "5000");
+      assert.equal(requests, 2);
+      assert.equal(output.diagnostics.options.no_cache, true);
+      assert.equal(Object.hasOwn(output.diagnostics, "cache"), false);
+      assert.match(output.content.text, /^\[grok-search\] This is a new fetch of the page, not the cached copy/);
+      assert.match(output.diagnostics.warnings.join("\n"), /--offset 5000 does not continue where that fetch stopped/);
+      assert.match(output.content.text, /rerun with --offset 10000 \(cached for 15 minutes\)/);
+
+      // auto reuses only what an auto fetch returned, not the --provider direct copies above.
+      output = await fetchJson();
+      assert.equal(requests, 3);
+      output = await fetchJson();
+      assert.equal(requests, 3);
+      assert.equal(output.diagnostics.cache.hit, true);
+
+      // A failure is not cached: the next run asks again.
+      const failState = await mkdtemp(path.join(tmpdir(), "grok-search-cache-state-"));
+      failNext = true;
+      const failed = await runNode(["scripts/fetch.js", "--provider", "direct", url], { GROK_STATE_DIR: failState });
+      assert.equal(failed.code, 1);
+      const retried = parseJson((await runNode(["scripts/fetch.js", "--provider", "direct", url], { GROK_STATE_DIR: failState })).stdout);
+      assert.equal(requests, 5);
+      assert.equal(Object.hasOwn(retried.diagnostics, "cache"), false);
+    }
+  );
+}
 
 await withServer(
   (req, res) => {
@@ -424,12 +535,15 @@ await withServer(
       assert.equal(body.max_turns, 3);
       assert.equal(body.stream, false);
       assert.deepEqual(body.tools, [{ type: "web_search" }]);
+      // A failed open_page stays out of total and by_action; the summary lists it under failed.
+      const payload = responsesPayload();
+      payload.output.push({ type: "web_search_call", status: "failed", action: { type: "open_page", url: "https://dead.example/x" } });
       res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify(responsesPayload()));
+      res.end(JSON.stringify(payload));
     });
   },
   async (_server, port) => {
-    const searchResult = await runNode(["scripts/search.js", "--no-extra", "mock query"], baseGrokEnv(port));
+    const searchResult = await runNode(["scripts/search.js", "mock query"], baseGrokEnv(port));
     assert.equal(searchResult.code, 0);
     const output = parseJson(searchResult.stdout);
     assert.equal(output.answer.text, "Responses answer.");
@@ -438,8 +552,8 @@ await withServer(
     assert.equal(output.diagnostics.options.x_from_date, undefined);
     assert.equal(output.diagnostics.options.x_to_date, undefined);
     assert.equal(Object.hasOwn(output.diagnostics.options, "search_mode"), false);
-    assert.equal(output.diagnostics.options.extra_mode, "off");
-    assert.deepEqual(output.diagnostics.provider_attempts, [{ provider: "grok-responses:xai", ok: true, count: 1 }]);
+    assert.equal(Object.hasOwn(output.diagnostics.options, "extra_mode"), false);
+    assert.deepEqual(output.diagnostics.provider_attempts, [{ provider: "grok-responses:xai", ok: true, count: 1, requests: 1 }]);
     assert.equal(output.diagnostics.cost_usd, 0.000015);
     assert.equal(output.sources.items.length, 1);
     assert.equal(output.sources.total, 1);
@@ -449,6 +563,7 @@ await withServer(
       upstream: null,
       trace: { web: 1, x: 0 },
       by_action: { search: 1 },
+      failed: [{ tool: "web_search", type: "web_search_call", status: "failed", action_type: "open_page", url: "https://dead.example/x", source_count: 0 }],
     });
     // Prompt budget is advisory; the block just puts it next to what was actually used.
     assert.deepEqual(output.diagnostics.search_budget, {
@@ -457,6 +572,8 @@ await withServer(
       used_web: 1,
       used_x: 0,
       used_total: 1,
+      used_searches: 1,
+      used_x_searches: 0,
       exceeded: false,
       enforced: false,
     });
@@ -466,7 +583,7 @@ await withServer(
 );
 
 // --instructions rides in the user message after the query so the system prompts stay a
-// stable cache prefix; Tavily/Firecrawl never see it (extras are off here, asserted via body).
+// stable cache prefix.
 await withServer(
   (req, res) => {
     assert.equal(req.url, "/responses");
@@ -483,7 +600,7 @@ await withServer(
   },
   async (_server, port) => {
     const searchResult = await runNode(
-      ["scripts/search.js", "--no-extra", "--instructions", "只要官方 changelog 链接，中文回答", "mock query"],
+      ["scripts/search.js", "--instructions", "只要官方 changelog 链接，中文回答", "mock query"],
       baseGrokEnv(port)
     );
     assert.equal(searchResult.code, 0, searchResult.stderr);
@@ -496,7 +613,7 @@ await withServer(
 );
 
 {
-  const missing = await runNode(["scripts/search.js", "--no-extra", "--instructions", "", "mock query"], baseGrokEnv(1));
+  const missing = await runNode(["scripts/search.js", "--instructions", "", "mock query"], baseGrokEnv(1));
   assert.equal(missing.code, 2);
   assert.match(missing.stderr, /--instructions 缺少值/);
 }
@@ -512,7 +629,7 @@ await withServer(
     });
   },
   async (_server, port) => {
-    const plain = await runNode(["scripts/search.js", "--no-extra", "mock query"], baseGrokEnv(port));
+    const plain = await runNode(["scripts/search.js", "mock query"], baseGrokEnv(port));
     assert.equal(plain.code, 0, plain.stderr);
     assert.equal(Object.hasOwn(parseJson(plain.stdout).diagnostics.options, "responses_parallel_tool_calls"), false);
   }
@@ -526,69 +643,70 @@ await withServer(
     });
   },
   async (_server, port) => {
-    const viaFlag = await runNode(["scripts/search.js", "--no-extra", "--responses-parallel-tool-calls", "false", "mock query"], baseGrokEnv(port));
+    const viaFlag = await runNode(["scripts/search.js", "--responses-parallel-tool-calls", "false", "mock query"], baseGrokEnv(port));
     assert.equal(viaFlag.code, 0, viaFlag.stderr);
     assert.equal(parseJson(viaFlag.stdout).diagnostics.options.responses_parallel_tool_calls, false);
-    const viaEnv = await runNode(["scripts/search.js", "--no-extra", "mock query"], baseGrokEnv(port, { GROK_RESPONSES_PARALLEL_TOOL_CALLS: "false" }));
+    const viaEnv = await runNode(["scripts/search.js", "mock query"], baseGrokEnv(port, { GROK_RESPONSES_PARALLEL_TOOL_CALLS: "false" }));
     assert.equal(viaEnv.code, 0, viaEnv.stderr);
     assert.equal(parseJson(viaEnv.stdout).diagnostics.options.responses_parallel_tool_calls, false);
-    const bad = await runNode(["scripts/search.js", "--no-extra", "--responses-parallel-tool-calls", "maybe", "mock query"], baseGrokEnv(port));
+    const bad = await runNode(["scripts/search.js", "--responses-parallel-tool-calls", "maybe", "mock query"], baseGrokEnv(port));
     assert.equal(bad.code, 2);
     assert.match(bad.stderr, /只能是 true 或 false/);
   }
 );
 
-// --source x keeps Tavily/Firecrawl off by default: they search the web, so for an X question
-// every one of their results is off-topic (6/6 in the 2026-09-08 side-by-side). --extra N opts in.
+// The prompt budgets searches and expects pages to be opened besides. Three searches and five
+// page reads are eight billed calls but within the budget of six searches.
 await withServer(
   (req, res) => {
     readJson(req, () => {
-      if (req.url !== "/responses") assert.fail(`extra provider must not be called on --source x: ${req.url}`);
+      const payload = responsesPayload();
+      for (const query of ["b", "c"]) payload.output.push({ type: "web_search_call", status: "completed", action: { type: "search", query } });
+      for (let page = 0; page < 5; page += 1) {
+        payload.output.push({ type: "web_search_call", status: "completed", action: { type: "open_page", url: `https://official.example/p${page}` } });
+      }
       res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify(responsesPayload("X only answer.")));
+      res.end(JSON.stringify(payload));
     });
   },
   async (_server, port) => {
-    const env = baseGrokEnv(port, {
-      TAVILY_API_KEY: "tavily-key",
-      TAVILY_API_URL: `http://127.0.0.1:${port}/tavily`,
-      FIRECRAWL_API_URL: `http://127.0.0.1:${port}/firecrawl`,
-    });
-    const searchResult = await runNode(["scripts/search.js", "--source", "x", "mock query"], env);
-    assert.equal(searchResult.code, 0, searchResult.stderr);
-    const output = parseJson(searchResult.stdout);
-    assert.equal(output.diagnostics.options.extra_mode, "off-x-only");
-    assert.deepEqual(output.diagnostics.options.extra_allocation, { tavily: 0, firecrawl: 0 });
-    assert.deepEqual(output.diagnostics.provider_attempts.map((attempt) => attempt.provider), ["grok-responses:xai"]);
-    assert.equal(output.diagnostics.warnings.some((warning) => /--source x searches X only/.test(warning)), true);
-    // --source both still runs extras by default, so nothing changes for the routed mode.
-    const both = await runNode(["scripts/search.js", "--source", "both", "--no-extra", "mock query"], env);
-    assert.equal(parseJson(both.stdout).diagnostics.options.extra_mode, "off");
+    const output = parseJson((await runNode(["scripts/search.js", "mock query"], baseGrokEnv(port))).stdout);
+    assert.equal(output.diagnostics.search_budget.used_total, 8);
+    assert.equal(output.diagnostics.search_budget.used_searches, 3);
+    assert.equal(output.diagnostics.search_budget.exceeded, false);
   }
 );
 
+// A retried Grok request is counted, and the run record, written after the stdout cut, says
+// what stdout carried of the answer.
+let grokRequests = 0;
 await withServer(
   (req, res) => {
-    readJson(req, (body) => {
-      res.writeHead(200, { "content-type": "application/json" });
-      if (req.url === "/responses") {
-        res.end(JSON.stringify(responsesPayload("X plus extras.")));
+    readJson(req, () => {
+      grokRequests += 1;
+      if (grokRequests === 1) {
+        res.writeHead(503, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: { message: "upstream busy" } }));
         return;
       }
-      assert.equal(req.url, "/firecrawl/search");
-      assert.equal(body.limit, 2);
-      res.end(JSON.stringify({ data: { web: [{ title: "Forced extra", url: "https://extra.example/forced" }] } }));
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(responsesPayload("A".repeat(60_000))));
     });
   },
   async (_server, port) => {
-    const searchResult = await runNode(
-      ["scripts/search.js", "--source", "x", "--extra", "2", "mock query"],
-      baseGrokEnv(port, { FIRECRAWL_API_URL: `http://127.0.0.1:${port}/firecrawl` })
+    const env = baseGrokEnv(port, { GROK_RETRY_MULTIPLIER: "0" });
+    const output = parseJson((await runNode(["scripts/search.js", "--max-chars", "60000", "mock query"], env)).stdout);
+    assert.equal(output.diagnostics.provider_attempts[0].requests, 2);
+    assert.equal(output.answer.truncated, true);
+    const record = JSON.parse(await readFile(output.sources.raw_path, "utf8"));
+    assert.equal(record.answer.length, 60_000);
+    assert.deepEqual(record.printed_answer, { chars: output.answer.chars, truncated: true, full_path: output.answer.full_path });
+    assert.match(record.diagnostics.warnings.join("\n"), /answer\.text keeps only the beginning/);
+    // The cut is also said at the end of answer.text, for agents that print only that.
+    assert.equal(
+      output.answer.text,
+      `${"A".repeat(output.answer.chars)}\n\n[grok-search] The answer was cut at ${output.answer.chars} of 60000 characters; the full answer is in ${output.answer.full_path}.`
     );
-    assert.equal(searchResult.code, 0, searchResult.stderr);
-    const output = parseJson(searchResult.stdout);
-    assert.equal(output.diagnostics.options.extra_mode, "explicit");
-    assert.equal(output.sources.items.some((source) => source.provider === "firecrawl"), true);
   }
 );
 
@@ -611,7 +729,6 @@ await withServer(
     const searchResult = await runNode(
       [
         "scripts/search.js",
-        "--no-extra",
         "--responses-max-turns",
         "2",
         "--responses-reasoning-effort",
@@ -640,7 +757,7 @@ function xPayload() {
         content: [
           {
             type: "output_text",
-            text: "X answer.",
+            text: "Searching X for the post.<!-- answer -->\nX answer.",
             annotations: [{ url: "https://x.com/xai/status/2087942296721559607", title: "1" }],
           },
         ],
@@ -673,7 +790,6 @@ await withServer(
     const searchResult = await runNode(
       [
         "scripts/search.js",
-        "--no-extra",
         "--source",
         "x",
         "--responses-allowed-x-handles",
@@ -704,6 +820,8 @@ await withServer(
     });
     assert.equal(output.diagnostics.search_budget.prompt_x, 4);
     assert.equal(output.diagnostics.search_budget.used_x, 8);
+    // Billed calls the trace does not show count as searches.
+    assert.equal(output.diagnostics.search_budget.used_x_searches, 8);
     assert.equal(output.diagnostics.search_budget.exceeded, true);
     assert.deepEqual(output.sources.items, [
       {
@@ -719,16 +837,18 @@ await withServer(
     // Every search leaves a run record, X searches included: the answer only exists here.
     assert.equal(typeof output.sources.raw_path, "string");
     const record = JSON.parse(await readFile(output.sources.raw_path, "utf8"));
-    assert.equal(record.schema_version, 2);
+    assert.equal(record.schema_version, 3);
     assert.equal(record.kind, "search");
     assert.equal(record.query, "mock query");
     assert.equal(record.answer, "X answer.");
+    // The narration before the answer marker is cut from the answer and kept in the record only.
+    assert.equal(record.answer_preamble, "Searching X for the post.");
     assert.equal(record.options.search_source, "x");
     assert.equal(record.diagnostics.responses_x_search_calls, 8);
     assert.equal(record.sources.items.length, 1);
     assert.equal(record.error, null);
     assert.equal(Object.hasOwn(record, "grok_raw"), false);
-    assert.deepEqual(record.argv.slice(0, 3), ["--no-extra", "--source", "x"]);
+    assert.deepEqual(record.argv.slice(0, 2), ["--source", "x"]);
   }
 );
 
@@ -743,7 +863,7 @@ await withServer(
   },
   async (_server, port) => {
     const searchResult = await runNode(
-      ["scripts/search.js", "--no-extra", "--x-from-date", "2026-08-01", "mock query"],
+      ["scripts/search.js", "--x-from-date", "2026-08-01", "mock query"],
       baseGrokEnv(port)
     );
     assert.equal(searchResult.code, 0);
@@ -762,7 +882,7 @@ await withServer(
   },
   async (_server, port) => {
     const searchResult = await runNode(
-      ["scripts/search.js", "--no-extra", "mock query"],
+      ["scripts/search.js", "mock query"],
       baseGrokEnv(port, { GROK_SEARCH_SOURCE: "both" })
     );
     assert.equal(searchResult.code, 0);
@@ -813,7 +933,7 @@ for (const [args, code, exitCode] of [
     async (_server, port) => {
       // An allow-list is stronger than a deny-list, so a non-conflicting one is honored.
       let output = parseJson(
-        (await runNode(["scripts/search.js", "--no-extra", "--responses-allowed-domains", "github.com", "q"], filterEnv(port)))
+        (await runNode(["scripts/search.js", "--responses-allowed-domains", "github.com", "q"], filterEnv(port)))
           .stdout
       );
       assert.deepEqual(output.diagnostics.options.responses_allowed_domains, ["github.com"]);
@@ -821,14 +941,14 @@ for (const [args, code, exitCode] of [
 
       // Two deny-lists compose instead of the CLI replacing the configured one.
       output = parseJson(
-        (await runNode(["scripts/search.js", "--no-extra", "--responses-excluded-domains", "medium.com", "q"], filterEnv(port)))
+        (await runNode(["scripts/search.js", "--responses-excluded-domains", "medium.com", "q"], filterEnv(port)))
           .stdout
       );
       assert.deepEqual(output.diagnostics.options.responses_excluded_domains, ["reddit.com", "quora.com", "medium.com"]);
 
       // Merging is case-insensitive and does not duplicate.
       output = parseJson(
-        (await runNode(["scripts/search.js", "--no-extra", "--responses-excluded-domains", "REDDIT.com", "q"], filterEnv(port)))
+        (await runNode(["scripts/search.js", "--responses-excluded-domains", "REDDIT.com", "q"], filterEnv(port)))
           .stdout
       );
       assert.deepEqual(output.diagnostics.options.responses_excluded_domains, ["reddit.com", "quora.com"]);
@@ -841,7 +961,7 @@ for (const [args, code, exitCode] of [
     [["--responses-allowed-domains", "github.com,QUORA.com"], "QUORA.com"],
     [["--source", "x", "--responses-allowed-x-handles", "spam_account"], "spam_account"],
   ]) {
-    result = await runNode(["scripts/search.js", "--no-extra", ...args, "q"], filterEnv(1));
+    result = await runNode(["scripts/search.js", ...args, "q"], filterEnv(1));
     assert.notEqual(result.code, 0);
     const output = parseJson(result.stdout);
     assert.equal(output.error.code, "RESPONSES_FILTER_FORBIDDEN");
@@ -854,7 +974,7 @@ for (const [args, code, exitCode] of [
     JSON.stringify({ responsesExcludedDomains: ["a.com", "b.com", "c.com", "d.com", "e.com"] }),
     "utf8"
   );
-  result = await runNode(["scripts/search.js", "--no-extra", "--responses-excluded-domains", "f.com", "q"], filterEnv(1));
+  result = await runNode(["scripts/search.js", "--responses-excluded-domains", "f.com", "q"], filterEnv(1));
   assert.notEqual(result.code, 0);
   assert.equal(parseJson(result.stdout).error.code, "RESPONSES_FILTER_LIMIT");
 }
@@ -881,7 +1001,7 @@ for (const [args, code, exitCode] of [
     async (_server, port) => {
       // A CLI deny-list subtracts from the configured allow-list instead of replacing it.
       let output = parseJson(
-        (await runNode(["scripts/search.js", "--no-extra", "--responses-excluded-domains", "peps.python.org", "q"], allowEnv(port)))
+        (await runNode(["scripts/search.js", "--responses-excluded-domains", "peps.python.org", "q"], allowEnv(port)))
           .stdout
       );
       assert.deepEqual(output.diagnostics.options.responses_allowed_domains, ["docs.python.org"]);
@@ -889,20 +1009,20 @@ for (const [args, code, exitCode] of [
 
       // A CLI allow-list must be a subset of it.
       output = parseJson(
-        (await runNode(["scripts/search.js", "--no-extra", "--responses-allowed-domains", "DOCS.python.org", "q"], allowEnv(port)))
+        (await runNode(["scripts/search.js", "--responses-allowed-domains", "DOCS.python.org", "q"], allowEnv(port)))
           .stdout
       );
       assert.deepEqual(output.diagnostics.options.responses_allowed_domains, ["DOCS.python.org"]);
     }
   );
 
-  result = await runNode(["scripts/search.js", "--no-extra", "--responses-allowed-domains", "github.com", "q"], allowEnv(1));
+  result = await runNode(["scripts/search.js", "--responses-allowed-domains", "github.com", "q"], allowEnv(1));
   assert.notEqual(result.code, 0);
   assert.equal(parseJson(result.stdout).error.code, "RESPONSES_FILTER_FORBIDDEN");
 
   // Emptying the allow-list would mean "no restriction" to the API — the opposite of intent.
   result = await runNode(
-    ["scripts/search.js", "--no-extra", "--responses-excluded-domains", "docs.python.org,peps.python.org", "q"],
+    ["scripts/search.js", "--responses-excluded-domains", "docs.python.org,peps.python.org", "q"],
     allowEnv(1)
   );
   assert.notEqual(result.code, 0);
@@ -930,7 +1050,7 @@ for (const [args, code, exitCode] of [
       });
     },
     async (_server, port) => {
-      const output = parseJson((await runNode(["scripts/search.js", "--no-extra", "q"], handleEnv(port))).stdout);
+      const output = parseJson((await runNode(["scripts/search.js", "q"], handleEnv(port))).stdout);
       assert.equal(output.diagnostics.options.search_source, "web");
       assert.equal(Object.hasOwn(output.diagnostics.options, "responses_excluded_x_handles"), false);
     }
@@ -950,7 +1070,7 @@ for (const [args, code, exitCode] of [
     },
     async (_server, port) => {
       const output = parseJson(
-        (await runNode(["scripts/search.js", "--no-extra", "--source", "both", "--no-x-images", "q"], handleEnv(port))).stdout
+        (await runNode(["scripts/search.js", "--source", "both", "--no-x-images", "q"], handleEnv(port))).stdout
       );
       assert.equal(output.diagnostics.options.search_source, "both");
       assert.deepEqual(output.diagnostics.options.responses_excluded_x_handles, ["spam_account"]);
@@ -970,10 +1090,10 @@ await withServer(
   },
   async (_server, port) => {
     const openRouterEnv = baseGrokEnv(port, { GROK_API_PROVIDER: "openrouter", GROK_MODEL: "x-ai/grok-4.1-fast" });
-    let output = parseJson((await runNode(["scripts/search.js", "--no-extra", "q"], openRouterEnv)).stdout);
+    let output = parseJson((await runNode(["scripts/search.js", "q"], openRouterEnv)).stdout);
     assert.deepEqual(output.diagnostics.warnings, []);
 
-    output = parseJson((await runNode(["scripts/search.js", "--no-extra", "--source", "web", "q"], openRouterEnv)).stdout);
+    output = parseJson((await runNode(["scripts/search.js", "--source", "web", "q"], openRouterEnv)).stdout);
     assert.match(output.diagnostics.warnings[0], /--source web is not enforced/);
   }
 );
@@ -1001,7 +1121,7 @@ await withServer(
     async (_server, port) => {
       // true used to attach X search; silently dropping that would change results.
       await writeRemovedConfig(true);
-      let result = await runNode(["scripts/search.js", "--no-extra", "mock query"], removedEnv(port));
+      let result = await runNode(["scripts/search.js", "mock query"], removedEnv(port));
       assert.notEqual(result.code, 0);
       let output = parseJson(result.stdout);
       assert.equal(output.error.code, "CONFIG_OPTION_REMOVED");
@@ -1009,14 +1129,14 @@ await withServer(
 
       // The environment form is rejected the same way, whatever the file says.
       await writeRemovedConfig(false);
-      result = await runNode(["scripts/search.js", "--no-extra", "mock query"], {
+      result = await runNode(["scripts/search.js", "mock query"], {
         ...removedEnv(port),
         GROK_RESPONSES_INCLUDE_X_SEARCH: "true",
       });
       assert.equal(parseJson(result.stdout).error.code, "CONFIG_OPTION_REMOVED");
 
       // false never did anything, so it keeps working: web search, nothing to warn about.
-      result = await runNode(["scripts/search.js", "--no-extra", "mock query"], removedEnv(port));
+      result = await runNode(["scripts/search.js", "mock query"], removedEnv(port));
       assert.equal(result.code, 0);
       output = parseJson(result.stdout);
       assert.equal(output.diagnostics.options.search_source, "web");
@@ -1037,7 +1157,7 @@ await withServer(
   },
   async (_server, port) => {
     const searchResult = await runNode(
-      ["scripts/search.js", "--no-extra", "--source", "x", "mock query"],
+      ["scripts/search.js", "--source", "x", "mock query"],
       baseGrokEnv(port, { GROK_API_PROVIDER: "openrouter", GROK_MODEL: "x-ai/grok-4.1-fast" })
     );
     assert.equal(searchResult.code, 0);
@@ -1061,213 +1181,11 @@ await withServer(
   },
   async (_server, port) => {
     const searchResult = await runNode(
-      ["scripts/search.js", "--no-extra", "--responses-openrouter-engine", "exa", "mock query"],
+      ["scripts/search.js", "--responses-openrouter-engine", "exa", "mock query"],
       baseGrokEnv(port, { GROK_API_PROVIDER: "openrouter", GROK_MODEL: "x-ai/grok-4.1-fast" })
     );
     assert.equal(searchResult.code, 0);
     assert.equal(parseJson(searchResult.stdout).model, "x-ai/grok-4.1-fast");
-  }
-);
-
-await withServer(
-  (() => {
-    const pending = new Map();
-    const seen = new Set();
-    const release = () => {
-      if (seen.size !== 3) return;
-      pending.get("/responses").end(JSON.stringify(responsesPayload("Parallel answer.")));
-      pending.get("/tavily/search").end(
-        JSON.stringify({
-          results: Array.from({ length: 3 }, (_item, index) => ({
-            title: `Tavily ${index + 1}`,
-            url: `https://tavily.example/${index + 1}`,
-            content: "tavily content",
-          })),
-        })
-      );
-      pending.get("/firecrawl/search").end(
-        JSON.stringify({
-          success: true,
-          creditsUsed: 2,
-          data: {
-            web: Array.from({ length: 3 }, (_item, index) => ({
-              title: `Firecrawl ${index + 1}`,
-              url: `https://firecrawl.example/${index + 1}`,
-              description: "firecrawl content",
-            })),
-          },
-        })
-      );
-    };
-    return (req, res) => {
-      readJson(req, (body) => {
-        seen.add(req.url);
-        pending.set(req.url, res);
-        res.writeHead(200, { "content-type": "application/json" });
-        if (req.url === "/tavily/search") assert.equal(body.max_results, 3);
-        if (req.url === "/firecrawl/search") {
-          assert.equal(body.limit, 3);
-          assert.equal(req.headers.authorization, undefined);
-        }
-        release();
-      });
-    };
-  })(),
-  async (_server, port) => {
-    const searchResult = await runNode(["scripts/search.js", "mock query"], baseGrokEnv(port, {
-      TAVILY_API_KEY: "tavily-key",
-      TAVILY_API_URL: `http://127.0.0.1:${port}/tavily`,
-      FIRECRAWL_API_URL: `http://127.0.0.1:${port}/firecrawl`,
-    }));
-    assert.equal(searchResult.code, 0);
-    const output = parseJson(searchResult.stdout);
-    assert.equal(output.answer.text, "Parallel answer.");
-    assert.equal(output.sources.total, 7);
-    assert.equal(output.sources.omitted, 0);
-    assert.equal(output.sources.items.filter((source) => source.provider === "tavily").length, 3);
-    assert.equal(output.sources.items.filter((source) => source.provider === "firecrawl").length, 3);
-    assert.deepEqual(output.diagnostics.options.extra_allocation, { tavily: 3, firecrawl: 3 });
-    assert.equal(output.diagnostics.options.firecrawl_auth_mode, "keyless");
-    assert.deepEqual(
-      output.diagnostics.provider_attempts.map((attempt) => [attempt.provider, attempt.ok, attempt.count]),
-      [
-        ["grok-responses:xai", true, 1],
-        ["tavily", true, 3],
-        ["firecrawl", true, 3],
-      ]
-    );
-  }
-);
-
-await withServer(
-  (req, res) => {
-    readJson(req, (body) => {
-      res.writeHead(200, { "content-type": "application/json" });
-      if (req.url === "/responses") {
-        res.end(JSON.stringify(responsesPayload()));
-        return;
-      }
-      assert.equal(req.url, "/firecrawl/search");
-      assert.equal(body.limit, 4);
-      assert.equal(req.headers.authorization, undefined);
-      res.end(JSON.stringify({ data: { web: [{ title: "Only Firecrawl", url: "https://firecrawl.example/only" }] } }));
-    });
-  },
-  async (_server, port) => {
-    const searchResult = await runNode(["scripts/search.js", "--extra", "4", "mock query"], baseGrokEnv(port, {
-      FIRECRAWL_API_URL: `http://127.0.0.1:${port}/firecrawl`,
-    }));
-    assert.equal(searchResult.code, 0);
-    const output = parseJson(searchResult.stdout);
-    assert.deepEqual(output.diagnostics.options.extra_allocation, { tavily: 0, firecrawl: 4 });
-    assert.equal(output.sources.items.filter((source) => source.provider === "firecrawl").length, 1);
-  }
-);
-
-await withServer(
-  (req, res) => {
-    req.resume();
-    if (req.url === "/responses") {
-      res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify(responsesPayload("Grok survives extra failure.")));
-      return;
-    }
-    res.writeHead(500, { "content-type": "application/json" });
-    res.end(JSON.stringify({ error: "firecrawl unavailable" }));
-  },
-  async (_server, port) => {
-    const searchResult = await runNode(["scripts/search.js", "--extra", "2", "mock query"], baseGrokEnv(port, {
-      FIRECRAWL_API_URL: `http://127.0.0.1:${port}/firecrawl`,
-      GROK_RETRY_MAX_ATTEMPTS: "1",
-    }));
-    assert.equal(searchResult.code, 0);
-    const output = parseJson(searchResult.stdout);
-    assert.equal(output.answer.text, "Grok survives extra failure.");
-    assert.equal(output.diagnostics.degraded, undefined);
-    assert.equal(output.diagnostics.provider_attempts[1].provider, "firecrawl");
-    assert.equal(output.diagnostics.provider_attempts[1].ok, false);
-    assert.equal(output.diagnostics.warnings.length, 1);
-  }
-);
-
-await withServer(
-  (req, res) => {
-    readJson(req, (body) => {
-      res.writeHead(200, { "content-type": "application/json" });
-      if (req.url === "/responses") {
-        res.end(JSON.stringify(responsesPayload()));
-        return;
-      }
-      assert.equal(body.limit, 2);
-      assert.equal(req.headers.authorization, "Bearer firecrawl-key");
-      res.end(JSON.stringify({ creditsUsed: 2, data: { web: [] } }));
-    });
-  },
-  async (_server, port) => {
-    const searchResult = await runNode(["scripts/search.js", "--extra", "2", "mock query"], baseGrokEnv(port, {
-      FIRECRAWL_API_KEY: "firecrawl-key",
-      FIRECRAWL_API_URL: `http://127.0.0.1:${port}/firecrawl`,
-    }));
-    const output = parseJson(searchResult.stdout);
-    assert.equal(output.diagnostics.options.firecrawl_auth_mode, "api_key");
-    assert.equal(output.diagnostics.provider_attempts[1].auth_mode, "api_key");
-  }
-);
-
-await withServer(
-  (req, res) => {
-    readJson(req, (body) => {
-      if (req.url === "/responses") {
-        res.writeHead(402, { "content-type": "application/json" });
-        res.end(JSON.stringify({ error: { code: "insufficient_quota", message: "credits exhausted" } }));
-        return;
-      }
-      assert.equal(body.limit, 2);
-      res.writeHead(200, { "content-type": "application/json" });
-      res.end(
-        JSON.stringify({
-          data: { web: [{ title: "Fallback source", url: "https://fallback.example/a", description: "raw result" }] },
-        })
-      );
-    });
-  },
-  async (_server, port) => {
-    const searchResult = await runNode(["scripts/search.js", "--extra", "2", "mock query"], baseGrokEnv(port, {
-      FIRECRAWL_API_URL: `http://127.0.0.1:${port}/firecrawl`,
-      GROK_RETRY_MAX_ATTEMPTS: "1",
-    }));
-    assert.equal(searchResult.code, 0);
-    const output = parseJson(searchResult.stdout);
-    assert.equal(output.diagnostics.degraded, true);
-    assert.equal(output.diagnostics.grok_error.code, "QUOTA_EXHAUSTED");
-    assert.match(output.answer.text, /Grok Responses 额度已耗尽/);
-    assert.match(output.answer.text, /Fallback source/);
-    assert.equal(output.sources.items.length, 1);
-    assert.equal(output.sources.items[0].provider, "firecrawl");
-  }
-);
-
-await withServer(
-  (req, res) => {
-    readJson(req, () => {
-      if (req.url === "/responses") {
-        res.writeHead(429, { "content-type": "application/json" });
-        res.end(JSON.stringify({ error: "rate limit: quota exhausted" }));
-        return;
-      }
-      res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ results: [{ title: "Tavily fallback", url: "https://tavily.example/fallback" }] }));
-    });
-  },
-  async (_server, port) => {
-    const searchResult = await runNode(["scripts/search.js", "--extra", "1", "mock query"], baseGrokEnv(port, {
-      TAVILY_API_KEY: "tavily-key",
-      TAVILY_API_URL: `http://127.0.0.1:${port}/tavily`,
-      FIRECRAWL_API_URL: `http://127.0.0.1:${port}/firecrawl`,
-      GROK_RETRY_MAX_ATTEMPTS: "1",
-    }));
-    assert.equal(searchResult.code, 0);
-    assert.equal(parseJson(searchResult.stdout).diagnostics.degraded, true);
   }
 );
 
@@ -1278,19 +1196,19 @@ await withServer(
     res.end(JSON.stringify({ error: "credits exhausted" }));
   },
   async (_server, port) => {
-    const searchResult = await runNode(["scripts/search.js", "--no-extra", "mock query"], baseGrokEnv(port, {
+    const searchResult = await runNode(["scripts/search.js", "mock query"], baseGrokEnv(port, {
       GROK_RETRY_MAX_ATTEMPTS: "1",
     }));
     assert.equal(searchResult.code, 1);
     const output = parseJson(searchResult.stdout);
     assertCommandErrorSchema(output, "searched_at", "GROK_QUOTA_EXHAUSTED");
-    assert.match(output.error.message, /extra sources 已显式关闭/);
+    assert.match(output.error.message, /^Grok Responses 额度已耗尽: /);
     assert.equal(output.diagnostics.grok_error.code, "QUOTA_EXHAUSTED");
   }
 );
 
-// A plain 429 that survives the retries is a rate limit, not an exhausted quota: it still
-// degrades when extras exist, but it must be named as what it is.
+// A plain 429 that survives the retries is a rate limit, not an exhausted quota, and is named as
+// what it is.
 await withServer(
   (req, res) => {
     req.resume();
@@ -1298,7 +1216,7 @@ await withServer(
     res.end(JSON.stringify({ error: "too many requests" }));
   },
   async (_server, port) => {
-    const searchResult = await runNode(["scripts/search.js", "--no-extra", "mock query"], baseGrokEnv(port, {
+    const searchResult = await runNode(["scripts/search.js", "mock query"], baseGrokEnv(port, {
       GROK_RETRY_MAX_ATTEMPTS: "1",
     }));
     assert.equal(searchResult.code, 1);
@@ -1321,27 +1239,22 @@ for (const [status, message] of [
       res.end(JSON.stringify({ error: message }));
     },
     async (_server, port) => {
-      const searchResult = await runNode(["scripts/search.js", "--no-extra", "mock query"], baseGrokEnv(port, {
+      const searchResult = await runNode(["scripts/search.js", "mock query"], baseGrokEnv(port, {
         GROK_RETRY_MAX_ATTEMPTS: "1",
       }));
       assert.equal(searchResult.code, 1);
       const output = parseJson(searchResult.stdout);
       assertCommandErrorSchema(output, "searched_at", "SEARCH_ERROR");
-      assert.equal(output.diagnostics.degraded, undefined);
     }
   );
 }
 
-result = await runNode(["scripts/search.js", "--extra", "1", "--no-extra", "mock query"]);
-assert.equal(result.code, 2);
-assertCommandErrorSchema(parseJson(result.stdout), "searched_at", "ARGUMENT_ERROR");
-
 await withServer(
   (req, res) => {
     readJson(req, (body) => {
-      if (req.url === "/tavily/extract") {
-        res.writeHead(500, { "content-type": "application/json" });
-        res.end(JSON.stringify({ error: "tavily failed" }));
+      if (req.url === "/page") {
+        res.writeHead(200, { "content-type": "text/html" });
+        res.end("<title>Page</title><p>HTML goes to the extractors</p>");
         return;
       }
       assert.equal(req.url, "/firecrawl/scrape");
@@ -1405,25 +1318,215 @@ await withServer(
     const output = parseJson(fetchResult.stdout);
     assert.equal(output.diagnostics.provider, "direct");
     assert.match(output.content.text, /Direct content/);
-    assert.deepEqual(output.diagnostics.provider_attempts.map((attempt) => attempt.provider), ["tavily", "firecrawl", "direct"]);
+    // Direct's HTML is kept from the first request and reused once Firecrawl and Tavily fail.
+    assert.deepEqual(output.diagnostics.provider_attempts.map((attempt) => attempt.provider), ["direct", "firecrawl", "tavily", "direct"]);
+    assert.equal(output.diagnostics.provider_attempts.at(-1).reused, true);
     // Fetch keeps its full text and provider trail in a run record too.
     const record = JSON.parse(await readFile(output.diagnostics.run_path, "utf8"));
     assert.equal(record.kind, "fetch");
     assert.equal(record.provider, "direct");
     assert.match(record.content, /Direct content/);
-    assert.equal(record.provider_attempts.length, 3);
+    assert.equal(record.provider_attempts.length, 4);
     assert.equal(record.error, null);
   }
 );
 
-// Domain filters given to Grok reach the extra providers too, and an extra that still falls
-// outside them ranks below Grok's in-scope search results instead of displacing them.
+// A fetch cut to the stdout budget: the record, written after the cut, carries the warning
+// and the file the full text went to.
+await withServer(
+  (req, res) => {
+    req.resume();
+    res.writeHead(200, { "content-type": "text/plain" });
+    res.end("y".repeat(60_000));
+  },
+  async (_server, port) => {
+    const output = parseJson((await runNode(["scripts/fetch.js", "--provider", "direct", "--max-chars", "100000", `http://127.0.0.1:${port}/big`])).stdout);
+    assert.equal(output.content.truncated, true);
+    assert.ok(output.content.chars < 60_000);
+    const record = JSON.parse(await readFile(output.diagnostics.run_path, "utf8"));
+    assert.equal(record.content.length, 60_000);
+    assert.deepEqual(record.printed_content, { offset: 0, chars: output.content.chars, truncated: true, full_path: output.content.full_path });
+    assert.match(record.warnings.join("\n"), /content\.text was cut to keep the whole output under 45KB/);
+    // The notice survives the cut and the whole output stays within the budget.
+    assert.ok(output.content.text.endsWith(`For the rest, rerun with --offset ${output.content.chars} (cached for 15 minutes) or read ${output.content.full_path}.`));
+    assert.ok(Buffer.byteLength(JSON.stringify(output, null, 2)) + 1 <= 45 * 1024);
+  }
+);
+
+// A deep URL that ends on the site's root page (gov.cn's script redirect for removed pages)
+// reports the final URL and a warning instead of passing as an ordinary fetch.
 await withServer(
   (req, res) => {
     readJson(req, (body) => {
       res.writeHead(200, { "content-type": "application/json" });
-      if (req.url === "/responses") {
-        res.end(
+      res.end(
+        JSON.stringify({ success: true, data: { markdown: "# 中国政府网\n\n首页", metadata: { statusCode: 200, sourceURL: body.url, url: "https://www.gov.cn/" } } })
+      );
+    });
+  },
+  async (_server, port) => {
+    const fetchResult = await runNode(
+      ["scripts/fetch.js", "--provider", "firecrawl", "https://www.gov.cn/zhengce/content/202511/content_7038000.htm"],
+      { FIRECRAWL_API_URL: `http://127.0.0.1:${port}` }
+    );
+    assert.equal(fetchResult.code, 0);
+    const output = parseJson(fetchResult.stdout);
+    assert.equal(output.final_url, "https://www.gov.cn/");
+    assert.equal(output.redirected, true);
+    assert.match(output.diagnostics.warnings.join("\n"), /redirected to the site's home page \(https:\/\/www\.gov\.cn\/\)/);
+    // The text itself opens with it: the page below is not the one asked for.
+    assert.match(output.content.text, /^\[grok-search\] The page redirected to the site's home page \(https:\/\/www\.gov\.cn\/\).*\n\n# 中国政府网/);
+    assert.equal(output.content.chars, "# 中国政府网\n\n首页".length);
+  }
+);
+
+// Tavily mapped www.compshare.cn/docs to an empty list (2026-10-07) while Direct read 200 URLs
+// from the sitemap. Under auto an empty list falls through to Direct; asked for by name, Tavily's
+// empty answer stands, with a warning.
+const tavilyMapBodies = [];
+await withServer(
+  (req, res) => {
+    if (req.url === "/tavily/map") {
+      readJson(req, (body) => {
+        tavilyMapBodies.push(body);
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ base_url: `http://${req.headers.host}`, results: [] }));
+      });
+      return;
+    }
+    req.resume();
+    if (req.url === "/sitemap.xml") {
+      res.writeHead(200, { "content-type": "application/xml" });
+      res.end(`<urlset><url><loc>http://${req.headers.host}/docs/a</loc></url></urlset>`);
+      return;
+    }
+    res.writeHead(404, { "content-type": "text/plain" });
+    res.end("not found");
+  },
+  async (_server, port) => {
+    const env = { TAVILY_API_KEY: "tavily-key", TAVILY_API_URL: `http://127.0.0.1:${port}/tavily` };
+    const auto = parseJson((await runNode(["scripts/map.js", `http://127.0.0.1:${port}/docs`], env)).stdout);
+    assert.deepEqual(auto.urls, [`http://127.0.0.1:${port}/docs/a`]);
+    assert.equal(auto.diagnostics.provider, "direct");
+    assert.deepEqual(
+      auto.diagnostics.provider_attempts.map((attempt) => [attempt.provider, attempt.ok, attempt.error ?? null]),
+      [
+        ["tavily", false, "returned no URLs"],
+        ["direct", true, null],
+      ]
+    );
+
+    const named = parseJson((await runNode(["scripts/map.js", "--provider", "tavily", `http://127.0.0.1:${port}/docs`], env)).stdout);
+    assert.deepEqual(named.urls, []);
+    assert.match(named.diagnostics.warnings.join("\n"), /Tavily Map returned no URLs/);
+
+    // Tavily keeps to the same scope as Direct Map: this site, at or under the URL's path.
+    await runNode(["scripts/map.js", "--provider", "tavily", `http://127.0.0.1:${port}/`], env);
+    assert.deepEqual(
+      tavilyMapBodies.map((body) => [body.allow_external, body.select_paths ?? null]),
+      [
+        [false, ["^/docs(/.*)?$"]],
+        [false, ["^/docs(/.*)?$"]],
+        [false, null],
+      ]
+    );
+  }
+);
+
+// Direct Map of a URL with a path keeps to that section: the page's own links first, then the
+// sitemaps robots.txt declares (an index here, expanded), all at /docs or below.
+await withServer(
+  (req, res) => {
+    const site = `http://${req.headers.host}`;
+    const send = (type, body, status = 200) => {
+      res.writeHead(status, { "content-type": type });
+      res.end(body);
+    };
+    if (req.url === "/robots.txt") return send("text/plain", `User-agent: *\nSitemap: ${site}/maps/index.xml\n`);
+    if (req.url === "/maps/index.xml") {
+      return send("application/xml", `<sitemapindex><sitemap><loc>${site}/maps/pages.xml</loc></sitemap></sitemapindex>`);
+    }
+    if (req.url === "/maps/pages.xml") {
+      const locs = [`${site}/docs/a`, `${site}/images/1`, `<![CDATA[${site}/docs/b]]>`, `${site}/images/2`];
+      return send("application/xml", `<urlset>${locs.map((loc) => `<url><loc>${loc}</loc></url>`).join("")}</urlset>`);
+    }
+    if (req.url === "/docs") {
+      return send("text/html", "<a href='/docs/c'>C</a><a href='/pricing'>Pricing</a><a href='/docs/a'>A</a><a href='https://other.example/docs/x'>X</a>");
+    }
+    send("text/plain", "not found", 404);
+  },
+  async (_server, port) => {
+    const site = `http://127.0.0.1:${port}`;
+    const output = parseJson((await runNode(["scripts/map.js", "--provider", "direct", `${site}/docs`])).stdout);
+    assert.deepEqual(output.urls, [`${site}/docs/c`, `${site}/docs/a`, `${site}/docs/b`]);
+    assert.match(output.diagnostics.warnings.join("\n"), /kept URLs under \/docs; 3 other URLs on 127\.0\.0\.1 were left out/);
+  }
+);
+
+// Direct Map follows a redirect to another host (example.com to www.example.com; here localhost
+// to 127.0.0.1) and maps where the page landed, as the old home-page fallback did. A URL that
+// names a file maps its directory.
+await withServer(
+  (req, res) => {
+    req.resume();
+    const port = req.headers.host.split(":")[1];
+    if (req.headers.host.startsWith("localhost")) {
+      res.writeHead(301, { location: `http://127.0.0.1:${port}${req.url}` });
+      res.end();
+      return;
+    }
+    if (req.url === "/" || req.url === "/docs/index.html") {
+      res.writeHead(200, { "content-type": "text/html" });
+      res.end("<a href='/docs/a'>A</a><a href='/docs/b'>B</a><a href='/pricing'>P</a>");
+      return;
+    }
+    res.writeHead(404, { "content-type": "text/plain" });
+    res.end("not found");
+  },
+  async (_server, port) => {
+    const site = `http://127.0.0.1:${port}`;
+    const moved = parseJson((await runNode(["scripts/map.js", "--provider", "direct", `http://localhost:${port}/`])).stdout);
+    assert.deepEqual(moved.urls, [`${site}/docs/a`, `${site}/docs/b`, `${site}/pricing`]);
+    assert.equal(moved.base_url, site);
+    assert.match(moved.diagnostics.warnings.join("\n"), new RegExp(`redirected to ${site}/; mapped ${site}/ instead`));
+
+    const file = parseJson((await runNode(["scripts/map.js", "--provider", "direct", `${site}/docs/index.html`])).stdout);
+    assert.deepEqual(file.urls, [`${site}/docs/a`, `${site}/docs/b`]);
+    assert.match(file.diagnostics.warnings.join("\n"), /kept URLs under \/docs;/);
+  }
+);
+
+// --direct-timeout is the per-request timeout Direct Map uses.
+await withServer(
+  (req, res) => {
+    req.resume();
+    if (req.url !== "/slow") {
+      res.writeHead(404, { "content-type": "text/plain" });
+      res.end("not found");
+      return;
+    }
+    setTimeout(() => {
+      res.writeHead(200, { "content-type": "text/html" });
+      res.end("<a href='/slow/a'>A</a>");
+    }, 2500);
+  },
+  async (_server, port) => {
+    const result = await runNode(["scripts/map.js", "--provider", "direct", "--direct-timeout", "1", `http://127.0.0.1:${port}/slow`]);
+    const output = parseJson(result.stdout);
+    assert.match(output.error.message, /请求超时（>1s）/);
+    assert.equal(output.diagnostics.options.direct_timeout, 1);
+  }
+);
+
+// Domain filters reach Grok's web_search tool, and a citation's marker title gives way to the
+// real title from Grok's own search listing.
+await withServer(
+  (req, res) => {
+    readJson(req, (body) => {
+      assert.equal(req.url, "/responses");
+      assert.deepEqual(body.tools[0].filters, { allowed_domains: ["github.com"] });
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(
           JSON.stringify({
             output: [
               {
@@ -1453,46 +1556,28 @@ await withServer(
             usage: { input_tokens: 10, output_tokens: 5 },
           })
         );
-        return;
-      }
-      assert.equal(req.url, "/firecrawl/search");
-      assert.deepEqual(body.includeDomains, ["github.com"]);
-      res.end(
-        JSON.stringify({
-          success: true,
-          data: {
-            web: [
-              { title: "Leaked blog", url: "https://blog.example/leak", description: "off domain" },
-              { title: "Gist", url: "https://gist.github.com/x", description: "in domain" },
-            ],
-          },
-        })
-      );
     });
   },
   async (_server, port) => {
     const searchResult = await runNode(
-      ["scripts/search.js", "--extra", "2", "--max-sources", "4", "--responses-allowed-domains", "github.com", "mock query"],
-      baseGrokEnv(port, { FIRECRAWL_API_URL: `http://127.0.0.1:${port}/firecrawl` })
+      ["scripts/search.js", "--max-sources", "4", "--responses-allowed-domains", "github.com", "mock query"],
+      baseGrokEnv(port)
     );
     assert.equal(searchResult.code, 0);
     const output = parseJson(searchResult.stdout);
-    assert.equal(output.sources.total, 5);
+    assert.equal(output.sources.total, 3);
     assert.deepEqual(
       output.sources.items.map((source) => source.url),
-      ["https://github.com/o/r/issues/1", "https://github.com/o/r/issues/2", "https://github.com/o/r/issues/3", "https://gist.github.com/x"]
+      ["https://github.com/o/r/issues/1", "https://github.com/o/r/issues/2", "https://github.com/o/r/issues/3"]
     );
     // The marker title on the citation was replaced by the listing's real title.
     assert.equal(output.sources.items[0].title, "Issue one");
     assert.equal(output.sources.items[0].source_type, "citation");
-    assert.equal(output.diagnostics.options.extra_domain_filter, "pushed");
-    const firecrawlAttempt = output.diagnostics.provider_attempts.find((attempt) => attempt.provider === "firecrawl");
-    assert.equal(firecrawlAttempt.off_domain, 1);
+    assert.deepEqual(output.diagnostics.options.responses_allowed_domains, ["github.com"]);
   }
 );
 
-// A Firecrawl quota failure during fetch leaves a cooldown behind, and the very next search
-// skips the Firecrawl extra channel instead of paying for the same 429 again.
+// A Firecrawl quota failure during fetch leaves a cooldown behind for the next fetch.
 {
   const cooldownState = await mkdtemp(path.join(tmpdir(), "grok-search-cooldown-state-"));
   await withServer(
@@ -1510,16 +1595,6 @@ await withServer(
         );
         return;
       }
-      if (req.url === "/firecrawl/search") {
-        res.writeHead(500, { "content-type": "text/plain" });
-        res.end("must not be called during cooldown");
-        return;
-      }
-      if (req.url === "/responses") {
-        res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify(responsesPayload("Cooldown answer.")));
-        return;
-      }
       res.writeHead(200, { "content-type": "text/html" });
       res.end("<title>Direct after quota</title><p>Direct content</p>");
     },
@@ -1529,7 +1604,7 @@ await withServer(
         GROK_STATE_DIR: cooldownState,
       });
       assert.equal(fetchResult.code, 0);
-      let output = parseJson(fetchResult.stdout);
+      const output = parseJson(fetchResult.stdout);
       assert.equal(output.diagnostics.provider, "direct");
       const firecrawlAttempt = output.diagnostics.provider_attempts.find((attempt) => attempt.provider === "firecrawl");
       assert.equal(firecrawlAttempt.ok, false);
@@ -1538,18 +1613,6 @@ await withServer(
       assert.equal(cooldown.reason, "credits");
       assert.equal(cooldown.auth_mode, "keyless");
 
-      const searchResult = await runNode(["scripts/search.js", "--extra", "2", "mock query"], baseGrokEnv(port, {
-        FIRECRAWL_API_URL: `http://127.0.0.1:${port}/firecrawl`,
-        GROK_STATE_DIR: cooldownState,
-      }));
-      assert.equal(searchResult.code, 0);
-      output = parseJson(searchResult.stdout);
-      assert.equal(output.answer.text, "Cooldown answer.");
-      assert.deepEqual(output.diagnostics.options.extra_allocation, { tavily: 0, firecrawl: 0 });
-      const skipped = output.diagnostics.provider_attempts.find((attempt) => attempt.provider === "firecrawl");
-      assert.equal(skipped.skipped, true);
-      assert.match(skipped.error, /cooldown until/);
-      assert.equal(output.diagnostics.warnings.some((warning) => /cooldown until/.test(warning)), true);
     }
   );
 }
@@ -1591,7 +1654,7 @@ await withServer(
     res.end(JSON.stringify(manySourcesPayload(20)));
   },
   async (_server, port) => {
-    const defaultCap = await runNode(["scripts/search.js", "--no-extra", "mock query"], baseGrokEnv(port));
+    const defaultCap = await runNode(["scripts/search.js", "mock query"], baseGrokEnv(port));
     assert.equal(defaultCap.code, 0);
     let output = parseJson(defaultCap.stdout);
     assert.equal(output.sources.total, 21);
@@ -1607,17 +1670,17 @@ await withServer(
     assert.equal(rawPayload.grok_tool_calls.length, 1);
     assert.equal(rawPayload.grok_tool_calls[0].query, "many sources");
 
-    const explicitCap = await runNode(["scripts/search.js", "--no-extra", "--max-sources", "3", "mock query"], baseGrokEnv(port));
+    const explicitCap = await runNode(["scripts/search.js", "--max-sources", "3", "mock query"], baseGrokEnv(port));
     output = parseJson(explicitCap.stdout);
     assert.equal(output.sources.returned, 3);
     assert.equal(output.sources.omitted, 18);
     assert.equal(output.diagnostics.options.max_sources, 3);
 
     // GROK_RUN_LOG=off keeps the disk untouched; --full-sources / GROK_DEBUG_RAW keep the raw body.
-    const noLog = await runNode(["scripts/search.js", "--no-extra", "mock query"], baseGrokEnv(port, { GROK_RUN_LOG: "off" }));
+    const noLog = await runNode(["scripts/search.js", "mock query"], baseGrokEnv(port, { GROK_RUN_LOG: "off" }));
     output = parseJson(noLog.stdout);
     assert.equal(output.sources.raw_path, null);
-    const withRaw = await runNode(["scripts/search.js", "--no-extra", "mock query"], baseGrokEnv(port, { GROK_DEBUG_RAW: "1" }));
+    const withRaw = await runNode(["scripts/search.js", "mock query"], baseGrokEnv(port, { GROK_DEBUG_RAW: "1" }));
     output = parseJson(withRaw.stdout);
     const rawRecord = JSON.parse(await readFile(output.sources.raw_path, "utf8"));
     assert.equal(rawRecord.grok_raw.output.length, 2);
@@ -1630,7 +1693,7 @@ await withServer(
     req.resume();
   },
   async (_server, port) => {
-    const searchResult = await runNode(["scripts/search.js", "--no-extra", "--deadline", "1", "mock query"], baseGrokEnv(port, {
+    const searchResult = await runNode(["scripts/search.js", "--deadline", "1", "mock query"], baseGrokEnv(port, {
       GROK_RETRY_MAX_ATTEMPTS: "1",
     }));
     assert.equal(searchResult.code, 1);

@@ -13,11 +13,10 @@ X search bills $5 per 1k calls, the same as web search. `diagnostics.responses_x
 ## Filters
 
 ```bash
-./scripts/search.js --source x "what is X saying about the outage"
-./scripts/search.js --source both "reaction to the release"
-./scripts/search.js --source x --responses-allowed-x-handles xai,OpenAI "query"
-./scripts/search.js --source x --x-from-date 2026-08-01 --x-to-date 2026-08-16 "query"
-./scripts/search.js --source x --extra 4 "query"           # also run Tavily/Firecrawl (web only)
+node {baseDir}/scripts/search.js --source x "what is X saying about the outage"
+node {baseDir}/scripts/search.js --source both "reaction to the release"
+node {baseDir}/scripts/search.js --source x --responses-allowed-x-handles xai,OpenAI "the question"
+node {baseDir}/scripts/search.js --source x --x-from-date 2026-08-01 --x-to-date 2026-08-16 "the question"
 ```
 
 - `--responses-allowed-x-handles` and `--responses-excluded-x-handles` are mutually exclusive, max 20 each, and either one implies X search.
@@ -33,19 +32,18 @@ Before a second X search, name the specific gap it closes. Do not put the previo
 
 ## Reading X Cards
 
-- Cards carry `x_handle` and `x_post_id` whenever the URL is an X post, plus `tool: "x_search"` when X search was actually mounted. Under `--source web`, an x.com card came from web search and is labeled as such.
+- Cards carry `x_post_id` for every X post URL and `x_handle` when the URL names one, plus `tool: "x_search"` when X search was actually mounted. xAI's X search often cites `/i/status/<id>`, which names no handle (120 of 186 grok-4.6 X-search cards on record); when the answer links the same post with its handle, the two become one card with the handle, otherwise the handle is only in `answer.text`. Under `--source web`, an x.com card came from web search and is labeled as such.
 - Some relays return X search as its underlying tools (`x_keyword_search`, `x_semantic_search`, `x_thread_fetch`, `x_user_search`); they are counted as `x_search` and `responses_tool_calls.by_action` shows them as `keyword_search`, `thread_fetch`, and so on. Other relays return no per-call items at all, so only the billed count is known.
 - The card has no post text or date. Those live in `answer.text`, which attributes each X claim to its handle and date. Cite the handle, not a bare URL.
 - Treat posts as personal statements: attribute each to its handle and date, keep claims separate from confirmations, and do not treat repetition across accounts as corroboration. When an official source exists, confirm the fact there and use X for reaction, timing, or first-hand experience.
-- Tavily and Firecrawl extras never search X, so on `--source x` they are off by default (`diagnostics.options.extra_mode: "off-x-only"`, with a warning). In the 2026-09-08 side-by-side all six of their results for an X question were unrelated web pages. `--extra N` forces them on; `--source both` keeps them on.
 
 ## Fetching A Post
 
-Firecrawl bills an X post at about 30 credits (an ordinary page is 1). The keyless daily tier is exhausted after about three such fetches, and the exhaustion also takes down Firecrawl search for the rest of the day (see `references/providers.md`, cooldown).
+Firecrawl bills an X post at about 30 credits (an ordinary page is 1). The keyless daily tier is exhausted after about three such fetches, and the exhaustion takes Firecrawl out of every fetch for the rest of the day (see `references/providers.md`, cooldown).
 
-- `--provider auto` with a URL that has both handle and post id: Direct runs first, whatever keys are configured, and succeeds only when the page names the handle (after X's redirect to the canonical handle), carries a date, and has non-boilerplate text. The result is the main post only. If validation fails, the normal order (Tavily → Firecrawl) runs; if that is unavailable too, the Direct text is returned with a warning.
+- `--provider auto` with a URL that has both handle and post id: Direct runs first, whatever keys are configured, and succeeds only when the page names the handle (after X's redirect to the canonical handle), carries a date, and has non-boilerplate text. The result is the main post only. If validation fails, Tavily runs and then Firecrawl (X pages keep Tavily first: Firecrawl bills about 30 credits for one); if that is unavailable too, the Direct text is returned with a warning.
 - Why Direct first even with keys (2026-09-08 side-by-side): Tavily is fast and free but returned one of three posts without any date and timed out on another; Firecrawl gives ISO timestamps, engagement counts and the thread, at about 30 credits and 10 seconds or more per post.
-- Need the thread or replies: `./scripts/fetch.js --provider firecrawl <post-url>`, deliberately, once. A `credits_used >= 10` fetch adds a warning stating the cost.
-- `/i/web/status/<id>` URLs carry no handle and cannot be validated; they use the normal order.
+- Need the thread or replies: `node {baseDir}/scripts/fetch.js --provider firecrawl <post-url>`, deliberately, once. A `credits_used >= 10` fetch adds a warning stating the cost.
+- `/i/status/<id>` and `/i/web/status/<id>` URLs carry no handle and cannot be validated; they use the normal order.
 
 When citing a post as decisive evidence, record its date, the model version, the client, and the login method the author used. Most contradictions between posts dissolve once those four are separated.

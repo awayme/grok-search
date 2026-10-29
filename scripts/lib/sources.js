@@ -86,7 +86,7 @@ export function normalizeSourceUrl(url) {
   }
 }
 
-function textField(value) {
+export function textField(value) {
   return typeof value === "string" && value.trim() ? value.trim() : "";
 }
 
@@ -98,76 +98,52 @@ export function isCitationMarker(title) {
   return /^\[?\d+\]?$/.test(String(title || "").trim());
 }
 
-function hasUsableTitle(source) {
-  const title = textField(source?.title);
-  return Boolean(title) && !isCitationMarker(title);
-}
-
-function sourceSnippet(source) {
-  return textField(source?.snippet) || textField(source?.description) || textField(source?.content);
+/** A title that says something about the page: present and not a citation marker. */
+export function usableTitle(title) {
+  const text = textField(title);
+  return Boolean(text) && !isCitationMarker(text);
 }
 
 /**
- * Fill what the first record of a URL lacks from a later duplicate. A Grok citation arrives
- * as a bare URL with a marker title; the same page found by Tavily or Firecrawl has a title
- * and a description. Dropping the duplicate threw both away.
+ * A source card from what Grok's response says about a page. Every card is built here, so it has
+ * one shape wherever in the response it came from: the URL normalized, strings trimmed, empty
+ * fields left out, `snippet` the one name for descriptive text. For an X post the handle and post id
+ * come from the URL. A title that is only a citation marker ("1") or the URL itself says nothing
+ * about the page and is dropped; an X handle stands in as "@handle". Returns null without a URL.
  */
-function mergeSourceFields(existing, incoming) {
-  const out = { ...existing };
-  let merged = false;
+export function sourceCard(url, { provider, source_type, tool, opened, title, snippet } = {}) {
+  const rawUrl = textField(url);
+  if (!rawUrl) return null;
+  const normalizedUrl = normalizeSourceUrl(rawUrl);
+  const givenTitle = textField(title);
+  const realTitle = givenTitle !== rawUrl && givenTitle !== normalizedUrl && usableTitle(givenTitle) ? givenTitle : "";
+  const post = parseXPostUrl(normalizedUrl);
 
-  if (!hasUsableTitle(out) && hasUsableTitle(incoming)) {
-    out.title = textField(incoming.title);
-    merged = true;
-  }
-  if (!sourceSnippet(out) && sourceSnippet(incoming)) {
-    out.snippet = sourceSnippet(incoming);
-    merged = true;
-  }
-  for (const key of ["published_date", "x_handle", "x_post_id"]) {
-    if (!textField(out[key]) && textField(incoming[key])) {
-      out[key] = textField(incoming[key]);
-      merged = true;
-    }
-  }
-  if (!Number.isFinite(out.score) && Number.isFinite(incoming.score)) {
-    out.score = incoming.score;
-    merged = true;
-  }
-  if (incoming.opened === true && out.opened !== true) {
-    out.opened = true;
-    merged = true;
-  }
-
-  if (merged) {
-    const provider = textField(incoming.provider);
-    if (provider && provider !== textField(out.provider)) {
-      out.merged_from = [...new Set([...(out.merged_from || []), provider])];
-    }
-  }
-  return out;
+  const card = { provider, url: normalizedUrl };
+  const sourceType = textField(source_type);
+  if (sourceType) card.source_type = sourceType;
+  const toolName = textField(tool);
+  if (toolName) card.tool = toolName;
+  if (opened === true) card.opened = true;
+  if (post?.x_handle) card.x_handle = post.x_handle;
+  if (post?.x_post_id) card.x_post_id = post.x_post_id;
+  const cardTitle = realTitle || (post?.x_handle ? `@${post.x_handle}` : "");
+  if (cardTitle) card.title = cardTitle;
+  const text = textField(snippet);
+  if (text) card.snippet = text;
+  return card;
 }
 
-export function mergeSources(...sourceLists) {
-  const indexByKey = new Map();
-  const merged = [];
-
-  for (const sources of sourceLists) {
-    for (const item of sources || []) {
-      const url = typeof item?.url === "string" ? item.url.trim() : "";
-      if (!url) continue;
-      const key = normalizeSourceUrl(url);
-      const existingIndex = indexByKey.get(key);
-      if (existingIndex == null) {
-        indexByKey.set(key, merged.length);
-        merged.push({ ...item, url });
-        continue;
-      }
-      merged[existingIndex] = mergeSourceFields(merged[existingIndex], item);
-    }
-  }
-
-  return merged;
+/**
+ * The identity a card is deduplicated by, everywhere Grok's cards meet (its citations, its
+ * search listings, the pages it opened): the normalized URL, or one key per X post whatever
+ * the URL form. xAI's X search cites `/i/status/<id>`, which names no author (120 of 186
+ * grok-4.6 X-search cards on record up to 2026-10-10), while the answer may link the same post
+ * as `/<handle>/status/<id>`; merging the two puts the handle on one card.
+ */
+export function sourceKey(url) {
+  const post = isXUrl(url) ? parseXPostUrl(url) : null;
+  return post?.x_post_id ? `x-post:${post.x_post_id}` : normalizeSourceUrl(url);
 }
 
 function clipText(value, maxChars) {
@@ -204,15 +180,8 @@ export function compactSource(source, { sourceChars = 400 } = {}) {
   const xPostId = textField(source?.x_post_id);
   if (xPostId) out.x_post_id = xPostId;
 
-  const snippet = clipText(sourceSnippet(source), sourceChars);
+  const snippet = clipText(source?.snippet, sourceChars);
   if (snippet) out.snippet = snippet;
-
-  if (Number.isFinite(source?.score)) out.score = source.score;
-
-  const publishedDate = textField(source?.published_date);
-  if (publishedDate) out.published_date = publishedDate;
-
-  if (Array.isArray(source?.merged_from) && source.merged_from.length) out.merged_from = [...source.merged_from];
 
   return out;
 }
@@ -221,66 +190,29 @@ export function compactSources(sources, options = {}) {
   return (sources || []).map((source) => compactSource(source, options)).filter(Boolean);
 }
 
-export function hostMatchesDomain(host, domain) {
-  const h = String(host || "").toLowerCase();
-  const d = String(domain || "")
-    .toLowerCase()
-    .replace(/^https?:\/\//, "")
-    .replace(/\/.*$/, "")
-    .replace(/^\*\./, "");
-  if (!h || !d) return false;
-  return h === d || h.endsWith(`.${d}`);
+export function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-export function urlInDomains(url, domains) {
-  if (!Array.isArray(domains) || !domains.length) return false;
-  let host;
-  try {
-    host = new URL(trimUrl(String(url || "").trim())).hostname;
-  } catch {
-    return false;
-  }
-  return domains.some((domain) => hostMatchesDomain(host, domain));
-}
-
-function isExtraSource(source) {
-  return !textField(source?.source_type);
+/** Grok's own order for its cards: cited > opened by Grok > merely listed by a search. */
+function grokRank(source) {
+  if (textField(source?.source_type) === "citation") return 0;
+  return source?.opened === true ? 1 : 2;
 }
 
 /**
- * An extra-provider result that falls outside the domain filters the caller gave Grok. The
- * providers get the same filters, so these only appear when one of them leaks; they are
- * kept but ranked last so they cannot displace in-scope candidates.
+ * The visible cards: when there are more than `maxSources`, the best by grokRank (input order
+ * breaks ties), printed in input order.
  */
-export function isOffDomainExtra(source, { allowedDomains = [], excludedDomains = [] } = {}) {
-  if (!isExtraSource(source)) return false;
-  if (allowedDomains.length && !urlInDomains(source?.url, allowedDomains)) return true;
-  if (excludedDomains.length && urlInDomains(source?.url, excludedDomains)) return true;
-  return false;
-}
-
-/**
- * Ranking for the visible cards: cited > opened by Grok > extra providers > merely listed by
- * a search > extra results outside the requested domains.
- */
-function sourceRank(source, filters) {
-  const type = textField(source?.source_type);
-  if (type === "citation") return 0;
-  if (source?.opened === true) return 1;
-  if (type === "searched") return 3;
-  return isOffDomainExtra(source, filters) ? 4 : 2;
-}
-
-export function selectSources(sources, { maxSources, allowedDomains = [], excludedDomains = [] } = {}) {
+export function selectSources(sources, { maxSources } = {}) {
   const list = sources || [];
   const total = list.length;
   const limit = Number.isFinite(maxSources) && maxSources > 0 ? maxSources : total;
-  const filters = { allowedDomains, excludedDomains };
 
   let items = list;
   if (total > limit) {
     items = list
-      .map((source, index) => ({ source, index, rank: sourceRank(source, filters) }))
+      .map((source, index) => ({ source, index, rank: grokRank(source) }))
       .sort((a, b) => a.rank - b.rank || a.index - b.index)
       .slice(0, limit)
       .sort((a, b) => a.index - b.index)
@@ -290,35 +222,13 @@ export function selectSources(sources, { maxSources, allowedDomains = [], exclud
   return { items, total, returned: items.length, omitted: total - items.length };
 }
 
-export function buildRawSourcesPayload({
-  query,
-  grok = [],
-  extra = [],
-  providerRaw = {},
-  providerAttempts = [],
-  grokToolCalls = [],
-  createdAt = new Date().toISOString(),
-} = {}) {
-  const provider_raw = {};
-  for (const [provider, raw] of Object.entries(providerRaw || {})) {
-    if (raw !== undefined) provider_raw[provider] = raw;
-  }
-
+/** What `--full-sources` attaches as sources.raw: every Grok source and tool call. */
+export function buildRawSourcesPayload({ query, grok = [], providerAttempts = [], grokToolCalls = [], createdAt = new Date().toISOString() } = {}) {
   return {
     query,
     grok,
-    extra,
-    provider_raw,
     provider_attempts: providerAttempts || [],
     ...(grokToolCalls?.length ? { grok_tool_calls: grokToolCalls } : {}),
     created_at: createdAt,
-  };
-}
-
-/** Normalize the allowed/excluded domain lists that search adapters push down. */
-export function domainFilters(filters) {
-  return {
-    allowed: Array.isArray(filters?.allowedDomains) ? filters.allowedDomains.filter(Boolean) : [],
-    excluded: Array.isArray(filters?.excludedDomains) ? filters.excludedDomains.filter(Boolean) : [],
   };
 }

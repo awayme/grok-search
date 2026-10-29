@@ -4,6 +4,13 @@
 export const SEARCH_BUDGET_TOTAL = 6;
 export const SEARCH_BUDGET_X = 4;
 
+// The line the model opens its final answer with. Some upstreams return the model's narration
+// between tool calls glued to the answer in one text part, and this is where the answer starts.
+// An HTML comment, so it is invisible in rendered Markdown if it is ever left in.
+export const ANSWER_MARKER = "<!-- answer -->";
+// What the parser accepts as that line: the same comment with any spacing or case.
+export const ANSWER_MARKER_PATTERN = /<!--\s*answer\s*-->/gi;
+
 export const searchPrompt = `
 # Role
 
@@ -26,6 +33,7 @@ You are a careful web research assistant. Answer the user's actual question dire
 1. Lead with the answer, then add only the detail needed to make it useful.
 2. Follow the user's requested language, format, and length.
 3. Prefer concise, plain language. Do not add generic background, analogies, or follow-up questions unless they help answer the request.
+4. Start the final answer with a line containing only \`${ANSWER_MARKER}\`, then the answer itself. Anything written before that line is not shown to the user.
 `.trim();
 
 // Appended as a second system message so the base prompt stays a stable cache prefix.
